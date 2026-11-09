@@ -186,6 +186,7 @@ import { buildTrustedResultDeliveryCard } from '../im/lark/trusted-result-delive
 import { resolvePluginResultAccessUrl } from './plugin-result-access-url.js';
 import { replyWithImageFallback } from '../im/lark/card-image-fallback.js';
 import { resolveReplyImages, type ReplyImageState } from '../im/lark/reply-images.js';
+import { resolveReplyMath } from '../im/lark/reply-math.js';
 import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { repairReplyMarkdown } from '../services/reply-markdown.js';
 import { renderBrandTemplate } from '../im/lark/brand-template.js';
@@ -24503,7 +24504,11 @@ function deliverFinalOutput(
       const safeUserText = managedReceiver && msg.userText !== undefined
         ? neutralizeLarkAtTags(msg.userText)
         : msg.userText;
-      const renderedAssistantText = await prepareLocalReplyImages(ds, safeAssistantText, imageFallback, isStillOwned);
+      const imageAssistantText = await prepareLocalReplyImages(ds, safeAssistantText, imageFallback, isStillOwned);
+      const renderedAssistantText = imageFallback.omitImages || managedReceiver ? imageAssistantText : await resolveReplyMath(repairReplyMarkdown(imageAssistantText), {
+        owns: isStillOwned,
+        upload: bytes => uploadImage(ds.larkAppId, bytes),
+      });
       if (!isStillOwned()) { onComplete?.(false); return; }
       const zeroPromptDispatchRoot = frozenReplyTarget?.mode === 'thread' ? frozenReplyTarget.rootMessageId
         : ds.scope === 'chat' ? ds.session.replyTargets?.[msg.turnId]?.rootMessageId

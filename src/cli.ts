@@ -14307,7 +14307,13 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     } else {
       // 回复一律卡片（纯文本 post 路径已删）。
       const customReplyCard = customCard as unknown as ReplyCardV2 | undefined;
-      const cardText = repairReplyMarkdown(text);
+      const cardText = customCard ? repairReplyMarkdown(text) : await (await import('./im/lark/reply-math.js')).resolveReplyMath(repairReplyMarkdown(text), {
+        owns: () => true,
+        upload: async bytes => {
+          await revalidateIsolatedOriginBeforeEffect();
+          return uploadImage(appId, bytes);
+        },
+      });
       // Inline `@Name` → `<at id=…>` at the exact spot it's written (CJK-name
       // aware, see applyInlineMentions); any --mention not inlined here is
       // rendered on the footer `发送给：` line below, not the body.

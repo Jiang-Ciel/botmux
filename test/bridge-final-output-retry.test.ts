@@ -364,6 +364,23 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(msg.content).toBe(unresolved);
   });
 
+  it.each(['pi', 'claude-code'] as const)('renders formulas for %s final replies without changing the native payload', async cliId => {
+    const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs(); ds.session.cliId = cliId; ds.adoptedFrom = undefined;
+    const content = String.raw`Answer: $$\frac{a_i}{b}$$`;
+    const msg = { ...finalOutputMsg(), content };
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, msg, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledOnce());
+    expect(uploadImageMock).toHaveBeenCalledOnce();
+    const bytes = uploadImageMock.mock.calls[0][1] as Buffer;
+    expect(bytes.subarray(0, 8)).toEqual(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+    expect(sessionReply.mock.calls[0][1]).toContain('img_v3_uploaded_preview');
+    expect(msg.content).toBe(content);
+  });
+
   it.each(['bridge', 'local-turn', 'local-turn-headless'] as const)(
     'forwards %s screenshot replies without exposing a local path as an image key', async kind => {
       const sessionReply = vi.fn(async (_anchor: string, card: string) => {
