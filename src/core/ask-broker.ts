@@ -432,7 +432,8 @@ function questionsShape(qs: PendingAsk['questions']): string {
       input: q.inputMode,
       field: q.input,
       custom: q.allowCustom !== false,
-      o: q.options.map((o) => [o.key, o.label, o.description ?? null]),
+      customInput: q.customInput,
+      o: q.options.map((o) => [o.key, o.label, o.description ?? null, o.preview ?? null]),
     })),
   );
 }

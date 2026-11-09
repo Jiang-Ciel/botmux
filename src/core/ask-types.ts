@@ -21,6 +21,7 @@ export interface AskOption {
   key: string;
   label: string;
   description?: string;
+  preview?: string;
 }
 
 /** Opt-in input schema for an atomic Card 2.0 form. */
@@ -38,6 +39,8 @@ export interface AskInputField {
  *  `label` 是人类可读的标题（暂保留向后兼容），`prompt` 是问题正文，
  *  `options` 是该问题的选项列表，`multiSelect` 表示是否允许多选。 */
 export interface AskQuestion {
+  /** Pi opt-in: client-side point selection plus a custom text field. */
+  customInput?: { maxLength: number };
   /** Opt-in Card 2.0 form input; legacy inputMode=text remains a chat reply. */
   input?: AskInputField;
   /** Disable free-form answers for constrained/native permission choices. */

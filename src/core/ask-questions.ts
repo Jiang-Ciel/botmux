@@ -31,7 +31,9 @@ export function parseOption(o: unknown, opts?: { clampDescription?: boolean }): 
       description = `${/[\uD800-\uDBFF]$/.test(head) ? head.slice(0, -1) : head}…`;
     } else if (trimmed) description = trimmed;
   }
-  return description ? { key: oo.key, label: oo.label, description } : { key: oo.key, label: oo.label };
+  if (oo.preview !== undefined && typeof oo.preview !== 'string') return 'bad_option_shape';
+  const preview = oo.preview !== undefined ? { preview: oo.preview as string } : {};
+  return description ? { key: oo.key, label: oo.label, description, ...preview } : { key: oo.key, label: oo.label, ...preview };
 }
 
 /** 校验 questions[] 数组，返回解析后的 AskQuestion[] 或错误码。 */
@@ -45,6 +47,15 @@ export function parseAskQuestions(arr: unknown, options?: { allowSingleOption?: 
     if (typeof qq.multiSelect !== 'boolean') return 'bad_multiSelect';
     if (qq.inputMode !== undefined && qq.inputMode !== 'text') return 'bad_inputMode';
     if (qq.allowCustom !== undefined && typeof qq.allowCustom !== 'boolean') return 'bad_allowCustom';
+    const custom = qq.customInput;
+    if (custom !== undefined && (qq.prompt.length > 2000 || !Array.isArray(qq.options) || qq.options.length > 4
+      || qq.options.some((o: any) => !o || typeof o.label !== 'string' || o.label.length > 200
+        || (o.description !== undefined && (typeof o.description !== 'string' || o.description.length > 500))
+        || (o.preview !== undefined && (typeof o.preview !== 'string' || o.preview.length > 500))))) return 'bad_input';
+    if (custom !== undefined && (!custom || typeof custom !== 'object' || Array.isArray(custom)
+      || Object.keys(custom).some(k => k !== 'maxLength')
+      || !Number.isInteger((custom as any).maxLength) || (custom as any).maxLength < 1 || (custom as any).maxLength > 1000
+      || qq.input !== undefined || qq.inputMode !== undefined || qq.defaultSelectedKeys !== undefined)) return 'bad_input';
     const input = qq.input === undefined ? undefined : parseInputField(qq.input);
     if (typeof input === 'string') return input;
     if (input && (qq.inputMode !== undefined || qq.multiSelect || qq.defaultSelectedKeys !== undefined)) return 'bad_input';
@@ -68,12 +79,14 @@ export function parseAskQuestions(arr: unknown, options?: { allowSingleOption?: 
     result.push({ prompt: qq.prompt, multiSelect: qq.multiSelect, options: opts,
       ...(qq.inputMode === 'text' ? { inputMode: 'text' as const } : {}),
       ...(input ? { input } : {}),
+      ...(custom !== undefined ? { customInput: { maxLength: (custom as any).maxLength } } : {}),
       ...(qq.allowCustom !== undefined ? { allowCustom: qq.allowCustom as boolean } : {}),
       ...(defaults !== undefined ? { defaultSelectedKeys: [...defaults as string[]] } : {}),
     });
   }
   // Mixing legacy chat-only inputs with form fields has no unambiguous submit path.
-  if (result.some(q => q.input) && (result.length > 20 || result.some(q => q.inputMode === 'text'))) return 'bad_input';
+  if (result.some(q => q.input || q.customInput) && (result.length > 20 || result.some(q => q.inputMode === 'text'))) return 'bad_input';
+  if (result.some(q => q.customInput) && (result.length > 4 || Buffer.byteLength(JSON.stringify(result), 'utf8') > 4000)) return 'bad_input';
   return result;
 }
 

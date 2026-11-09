@@ -1,6 +1,6 @@
 import type { AskQuestion } from './ask-types.js';
 
-export const hasAskForm = (questions: ReadonlyArray<AskQuestion>): boolean => questions.some(q => !!q.input);
+export const hasAskForm = (questions: ReadonlyArray<AskQuestion>): boolean => questions.some(q => !!q.input || !!q.customInput);
 
 /** Count CHARACTERS (Unicode code points), matching the Feishu client's
  *  `max_length` accounting. `string.length` counts UTF-16 code units, so a
@@ -20,13 +20,33 @@ export function parseAskFormValues(questions: ReadonlyArray<AskQuestion>, raw: u
 } | null {
   if (!hasAskForm(questions) || !raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
   const values = raw as Record<string, unknown>;
-  if (Object.keys(values).some(k => !/^q\d+$/.test(k) || !questions[Number(k.slice(1))] || k !== `q${Number(k.slice(1))}`)) return null;
+  const allowed = new Set<string>();
+  questions.forEach((q, i) => {
+    if (q.customInput) { allowed.add(`q${i}_text`); q.options.forEach((_o, n) => allowed.add(`q${i}_o${n}`)); }
+    else allowed.add(`q${i}`);
+  });
+  if (Object.keys(values).some(k => !allowed.has(k))) return null;
   const answers: string[][] = [];
   const inputs: Array<string | null> = [];
   let total = 0;
   for (const [i, q] of questions.entries()) {
     const value = values[`q${i}`];
-    if (q.input) {
+    if (q.customInput) {
+      const picked: string[] = [];
+      for (const [n, option] of q.options.entries()) {
+        const checked = values[`q${i}_o${n}`];
+        if (checked !== undefined && checked !== null && typeof checked !== 'boolean') return null;
+        if (checked === true) picked.push(option.key);
+      }
+      const rawText = values[`q${i}_text`];
+      if (rawText !== undefined && rawText !== null && typeof rawText !== 'string') return null;
+      const text = typeof rawText === 'string' && rawText.trim() ? rawText : null;
+      if (text && charCount(text) > q.customInput.maxLength) return null;
+      if ((!picked.length && !text) || (!q.multiSelect && (picked.length > 1 || (picked.length && text)))) return null;
+      total += text ? charCount(text) : 0;
+      if (total > 32768) return null;
+      answers.push(picked); inputs.push(text);
+    } else if (q.input) {
       if (value !== undefined && value !== null && typeof value !== 'string') return null;
       const rawText = typeof value === 'string' ? value : '';
       const text = q.input.type === 'number' ? rawText.trim() : rawText;

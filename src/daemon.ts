@@ -11087,6 +11087,7 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
 };
 ipcRoute('POST', '/api/asks', handleAskRequest);
 ipcRoute('POST', '/api/asks/form-v1', handleAskRequest);
+ipcRoute('POST', '/api/asks/pi-v1', handleAskRequest);
 
 // The hook behind a permission card reports that its CLI ended the confirmation
 // without the card (built-in timeout, terminal choice, interrupt). Same caller

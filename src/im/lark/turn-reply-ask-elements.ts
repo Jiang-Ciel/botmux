@@ -76,8 +76,9 @@ export function turnReplyAskSummary(entry: ReplyCardAsk, locale: Locale = 'zh'):
   const { ask, result } = entry;
   const lines = ask.questions.map((q, i) => {
     const labels = result?.kind === 'answered'
-      ? result.customAnswers?.[i] ?? result.inputs?.[i] ?? result.answers[i]?.map(key => q.options.find(o => o.key === key)?.label ?? key).join(', ') : '';
-    return `🙋 ${safe(q.prompt)}${labels ? `\n✓ ${safe(labels)}` : ''}`;
+      ? result.customAnswers?.[i] ?? result.answers[i]?.map(key => q.options.find(o => o.key === key)?.label ?? key).join(', ') : '';
+    const input = result?.kind === 'answered' ? result.inputs?.[i] : null;
+    return `🙋 ${safe(q.prompt)}${labels || input ? `\n✓ ${safe([labels, input].filter(Boolean).join(' / '))}` : ''}`;
   });
   const permission = result ? permissionAskSettleStatus(ask, result, locale) : undefined;
   if (result?.kind === 'answered') {

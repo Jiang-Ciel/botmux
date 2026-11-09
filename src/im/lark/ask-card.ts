@@ -443,6 +443,8 @@ export function renderAskCard(
   const render = (promptCap: number, descriptionCap: number) => renderAskCardWithCap(ask, result, opts, promptCap, descriptionCap);
   const full = render(Infinity, Infinity);
   if (fits(full)) return { json: full, promptTruncated: false, descriptionsTruncated: false, fits: true };
+  // Pi options/previews are decision content: never silently truncate a form.
+  if (ask.questions.some(q => q.customInput)) throw new Error('Pi question form exceeds card transport budget');
   const longestDescription = Math.max(0, ...ask.questions.flatMap(q => q.options.map(o => o.description?.length ?? 0)));
   if (longestDescription > 0) {
     const withoutDescriptions = render(Infinity, 0);

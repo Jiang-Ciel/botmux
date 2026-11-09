@@ -172,6 +172,7 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
   if (r.answererOpenId !== undefined && (originKind !== 'explicit' || typeof r.answererOpenId !== 'string'
     || !/^ou_[A-Za-z0-9_-]{1,128}$/.test(r.answererOpenId))) return { error: 'bad_answererOpenId' };
   // Native hooks keep their existing text-reply contract; only explicit CLI form asks opt in.
+  if (questions.some(q => q.customInput) && originKind !== 'pi_hook') return { error: 'bad_input' };
   if (questions.some(q => q.input) && originKind !== 'explicit') return { error: 'bad_input' };
   const parsed: AskApiBody = {
     ...(r.answererOpenId !== undefined ? { answererOpenId: r.answererOpenId as string } : {}),

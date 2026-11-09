@@ -17800,7 +17800,7 @@ async function postAsk(body: Record<string, unknown>): Promise<import('./core/as
   try {
     // Versioned admission prevents an old daemon silently dropping the
     // respondent restriction on a choice-only request. Never downgrade it.
-    const endpoint = body.answererOpenId || (body.questions as import('./core/ask-types.js').AskQuestion[] | undefined)?.some(q => q.input)
+    const endpoint = body.originKind === 'pi_hook' ? '/api/asks/pi-v1' : body.answererOpenId || (body.questions as import('./core/ask-types.js').AskQuestion[] | undefined)?.some(q => q.input || q.customInput)
       ? '/api/asks/form-v1' : '/api/asks';
     // No client-side timeout — broker enforces `timeoutMs` and will respond
     // with `kind:'timedOut'` so this fetch always settles.
@@ -18059,7 +18059,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
       // key，令 `selected` 的含义随选中数量漂移（违反公开契约）。
       selected: multiSelect || questions?.some(q => q.multiSelect) ? null : selected,
       answers: result.kind === 'answered' ? (result.answers as string[][]) : null,
-      ...(questions?.some(q => q.input) ? { inputs: result.kind === 'answered' ? [...result.inputs ?? questions.map(() => null)] : null } : {}),
+      ...(questions?.some(q => q.input || q.customInput) ? { inputs: result.kind === 'answered' ? [...result.inputs ?? questions.map(() => null)] : null } : {}),
       by: result.kind === 'answered' ? result.by : null,
       comment: result.kind === 'answered' ? result.comment : null,
       ...(result.kind === 'answered' && result.customAnswers ? { customAnswers: result.customAnswers } : {}),
@@ -18310,7 +18310,7 @@ export async function runHook(
     questions: parsed.questions,
     timeoutMs,
     requestId,
-    originKind: 'hook',
+    originKind: cliId === 'pi' ? 'pi_hook' : 'hook',
     ...(hookOrigin?.turnId ? { originTurnId: hookOrigin.turnId } : {}),
     ...(hookOrigin?.dispatchAttempt !== undefined ? { originDispatchAttempt: hookOrigin.dispatchAttempt } : {}),
   };
@@ -18402,7 +18402,7 @@ export async function runHook(
   }
 
   if (result.kind === 'answered') {
-    return { stdout: adapter.formatAnswer(result.answers, parsed, result.comment, result.customAnswers) };
+    return { stdout: adapter.formatAnswer(result.answers, parsed, result.comment, result.customAnswers, result.inputs) };
   }
 
   // timedOut / invalidated → passthrough 放行

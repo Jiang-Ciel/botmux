@@ -24,7 +24,7 @@ export function buildAskFormElements(ask: PendingAsk, locale: Locale, result?: A
   if (result) {
     for (const [i, q] of ask.questions.entries()) {
       const value = result.kind === 'answered'
-        ? result.inputs?.[i] ?? result.answers[i]?.map(k => q.options.find(o => o.key === k)?.label ?? k).join(', ') : '';
+        ? [result.answers[i]?.map(k => q.options.find(o => o.key === k)?.label ?? k).join(', '), result.inputs?.[i]].filter(Boolean).join('\n') : '';
       elements.push({ tag: 'markdown', content: `**${safe(q.prompt)}**${value ? `\n${safe(displayValue(value))}` : ''}` });
       const details = q.input ? undefined : optionDescriptions(q, locale, extras.descriptionCap);
       if (details) elements.push({ tag: 'markdown', text_size: 'notation', content: details.content });
@@ -40,7 +40,19 @@ export function buildAskFormElements(ask: PendingAsk, locale: Locale, result?: A
   const fields: Array<Record<string, any>> = [];
   ask.questions.forEach((q, i) => {
     fields.push({ tag: 'markdown', content: `${i === 0 && extras.mention ? `${extras.mention}\n` : ''}**${safe(q.prompt)}**${q.input?.required === false ? (en ? ' (optional)' : '（选填）') : ''}` });
-    if (q.input) {
+    if (q.customInput) {
+      q.options.forEach((option, n) => {
+        fields.push({ tag: 'checker', name: `q${i}_o${n}`, checked: false,
+          text: plain(option.label), overall_checkable: true,
+          checked_style: { show_strikethrough: false, opacity: 1 }, padding: '4px', margin: '0px' });
+        if (option.description) fields.push({ tag: 'markdown', text_size: 'notation', content: safe(option.description) });
+        if (option.preview) fields.push({ tag: 'collapsible_panel', expanded: false,
+          header: { title: plain(en ? 'Preview' : '查看预览') }, elements: [{ tag: 'markdown', content: safe(option.preview) }] });
+      });
+      fields.push({ tag: 'input', name: `q${i}_text`, input_type: 'multiline_text', width: 'fill', required: false,
+        max_length: q.customInput.maxLength, label: plain('Type something / 自定义内容'),
+        placeholder: plain(q.multiSelect ? '可填写自定义内容，也可与所选项一起提交' : '或填写自己的答案（填写时请取消上面的勾选）') });
+    } else if (q.input) {
       // number uses text transport intentionally: validate decimals server-side
       // without coercion/precision loss or inventing a platform-specific widget.
       fields.push({ tag: 'input', name: `q${i}`, input_type: q.input.type === 'number' ? 'text' : 'multiline_text',

@@ -3,6 +3,7 @@ import claude from './claude-code.js';
 import opencode from './opencode.js';
 import coco from './coco.js';
 import dsh from './dsh.js';
+import pi from './pi.js';
 
 const REGISTRY: Record<string, HookAskAdapter> = {
   'claude-code': claude,
@@ -27,6 +28,7 @@ const REGISTRY: Record<string, HookAskAdapter> = {
   coco,
   // DSH/dsh-tui bridge plugins normalize ctx.userQuestions requests into this
   // payload shape and expect a plain DSH AskUserQuestionAnswer JSON object back.
+  pi,
   dsh,
   'dsh-tui': dsh,
 };
