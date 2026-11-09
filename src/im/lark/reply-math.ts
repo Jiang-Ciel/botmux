@@ -1,4 +1,5 @@
 import MarkdownIt from 'markdown-it';
+import { inlineMathText } from './reply-math-text.js';
 
 export interface ReplyMathSpan { start: number; end: number; latex: string; display: boolean }
 const parser = new MarkdownIt({ html: false, linkify: false });
@@ -74,6 +75,12 @@ export async function resolveReplyMath(markdown: string, io: {
   for (const span of spans) {
     if (!io.owns()) return markdown;
     output += markdown.slice(cursor, span.start);
+    const text = !span.display ? inlineMathText(span.latex) : undefined;
+    if (text !== undefined) {
+      output += text;
+      cursor = span.end;
+      continue;
+    }
     let replacement: string;
     try {
       const id = `${span.display}:${span.latex}`;

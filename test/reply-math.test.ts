@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { replyMathSpans, resolveReplyMath } from '../src/im/lark/reply-math.js';
 import { renderReplyMath } from '../src/im/lark/reply-math-render.js';
+import { inlineMathText } from '../src/im/lark/reply-math-text.js';
 import { buildCanonicalFinalReplyCard } from '../src/im/lark/md-card.js';
 
 const fakeRender = async () => Buffer.from('png');
@@ -29,16 +30,16 @@ describe('LaTeX reply rendering', () => {
   });
   it('renders and uploads once per identical expression and builds native image elements', async () => {
     const upload = vi.fn(async () => 'img_v3_formula');
-    const original = String.raw`结果 $x_i$ 与 $x_i$。`;
+    const original = String.raw`结果 $\frac{a}{b}$ 与 $\frac{a}{b}$。`;
     const markdown = await resolveReplyMath(original, { owns: () => true, upload, render: fakeRender });
     expect(upload).toHaveBeenCalledTimes(1);
     const card = JSON.parse(buildCanonicalFinalReplyCard({ markdown }));
     expect(JSON.stringify(card)).toContain('img_v3_formula');
-    expect(markdown).not.toContain('$x_i$');
-    expect(original).toBe(String.raw`结果 $x_i$ 与 $x_i$。`);
+    expect(markdown).not.toContain(String.raw`$\frac{a}{b}$`);
+    expect(original).toBe(String.raw`结果 $\frac{a}{b}$ 与 $\frac{a}{b}$。`);
   });
   it('preserves failed formulas as literal code without losing surrounding prose', async () => {
-    const markdown = await resolveReplyMath('before $x_i$ after', {
+    const markdown = await resolveReplyMath('before $$x_i$$ after', {
       owns: () => true, upload: async () => { throw new Error('offline'); }, render: fakeRender,
     });
     expect(markdown).toContain('```latex\nx_i\n```');
@@ -48,7 +49,7 @@ describe('LaTeX reply rendering', () => {
   it('does not upload after ownership is lost during rendering', async () => {
     let owned = true;
     const upload = vi.fn(async () => 'img_v3_formula');
-    const original = '$x$';
+    const original = '$$x$$';
     const output = await resolveReplyMath(original, { owns: () => owned, upload,
       render: async () => { owned = false; return Buffer.from('png'); } });
     expect(output).toBe(original);
@@ -79,14 +80,15 @@ describe('LaTeX reply rendering', () => {
     expect(markdown).not.toContain('```latex');
     const card = JSON.parse(buildCanonicalFinalReplyCard({ markdown }));
     const images = card.body.elements.filter((e: any) => e.tag === 'img');
-    expect(images).toHaveLength(spans.length);
+    expect(images).toHaveLength(spans.filter(span => span.display || inlineMathText(span.latex) === undefined).length);
+    expect(markdown).toContain('其中 Fᵢ 是第 i 个专家的 FFN。');
     for (const image of images) {
       expect(image.scale_type).toBe('crop_center');
       expect(image.size).toMatch(/^\d+px \d+px$/);
       expect(image.mode).toBeUndefined();
     }
     // Short variable names must not become full-width banners.
-    expect(images.some((image: any) => Number(image.size.split('px')[0]) < 50)).toBe(true);
+    expect(images.some((image: any) => Number(image.size.split('px')[0]) < 150)).toBe(true);
     expect(images.some((image: any) => Number(image.size.split('px')[0]) > 100)).toBe(true);
   });
   it('matches image display size to PNG aspect ratio without upscaling small formulas', async () => {
@@ -100,6 +102,36 @@ describe('LaTeX reply rendering', () => {
     expect(height).toBe(Math.round(bytes.readUInt32BE(20) / 2));
     expect(image.preview).toBe(true);
     expect(image.transparent).toBe(true);
+  });
+  it.each([
+    ['i', 'i'], ['K=1', 'K=1'], ['F_i', 'Fᵢ'], ['x_t', 'xₜ'], ['x_i^2', 'xᵢ²'],
+    ['n_{12}', 'n₁₂'], [String.raw`\alpha+\beta`, 'α+β'], [String.raw`x\leq 1`, 'x≤ 1'],
+    ['x<1', 'x&#60;1'],
+  ])('converts representable inline expression %s without line breaks', (input, expected) => {
+    expect(inlineMathText(input)).toBe(expected);
+  });
+  it.each([String.raw`\frac{a}{b}`, String.raw`\sqrt{x}`, String.raw`\sum_i x_i`,
+    'p_{t,i}', 'x_q', 'x^{ab}', '(x+y)^2', String.raw`\bar p_i`,
+    String.raw`\mathbf{x}`, 'x_{i,j}', String.raw`\unknown{x}`, 'x_i_i'])('keeps unsupported expression %s as an image', input => {
+    expect(inlineMathText(input)).toBeUndefined();
+  });
+  it('keeps prose/list/emphasis layout and avoids all uploads for simple inline formulas', async () => {
+    const original = String.raw`其中 **\(F_i\)** 是第 \(i\) 个专家的 FFN。
+- 当 \(K=1\) 时，\(x_t\) 不需要换行。
+- 希腊字母 \(\alpha\)，幂 $x_i^2$。`;
+    const upload = vi.fn(async () => 'img_v3_unused');
+    const render = vi.fn(fakeRender);
+    const markdown = await resolveReplyMath(original, { owns: () => true, upload, render });
+    expect(markdown).toBe('其中 **Fᵢ** 是第 i 个专家的 FFN。\n- 当 K=1 时，xₜ 不需要换行。\n- 希腊字母 α，幂 xᵢ²。');
+    expect(upload).not.toHaveBeenCalled();
+    expect(render).not.toHaveBeenCalled();
+    expect(original).toContain(String.raw`\(F_i\)`);
+  });
+  it('keeps even simple explicit display math as sized images', async () => {
+    const upload = vi.fn(async () => 'img_v3_block');
+    const markdown = await resolveReplyMath(String.raw`行内 \(K=1\)。\[K=1\]`, { owns: () => true, upload, render: fakeRender });
+    expect(markdown).toMatch(/^行内 K=1。\n\n!\[botmux-math:/);
+    expect(upload).toHaveBeenCalledOnce();
   });
   it('rejects unknown commands and oversized raster dimensions', async () => {
     await expect(renderReplyMath(String.raw`\notACommand{x}`, false)).rejects.toThrow();

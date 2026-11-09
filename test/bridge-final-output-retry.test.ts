@@ -364,6 +364,23 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(msg.content).toBe(unresolved);
   });
 
+  it.each(['pi', 'claude-code'] as const)('preserves text-line layout for %s simple inline math', async cliId => {
+    const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs(); ds.session.cliId = cliId; ds.adoptedFrom = undefined;
+    const content = String.raw`其中 \(F_i\) 是第 \(i\) 个专家，当 \(K=1\) 时使用 \(x_t\)。`;
+    const msg = { ...finalOutputMsg(), content };
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, msg, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledOnce());
+    const card = JSON.parse(sessionReply.mock.calls[0][1]);
+    expect(card.body.elements.some((e: any) => e.tag === 'markdown'
+      && e.content === '其中 Fᵢ 是第 i 个专家，当 K=1 时使用 xₜ。')).toBe(true);
+    expect(uploadImageMock).not.toHaveBeenCalled();
+    expect(msg.content).toBe(content);
+  });
+
   it.each(['pi', 'claude-code'] as const)('renders formulas for %s final replies without changing the native payload', async cliId => {
     const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
     initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
