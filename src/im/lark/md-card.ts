@@ -1722,6 +1722,14 @@ function singleImgElement(imgKey: string): any {
 
 /** Botmux width presets, not Feishu's square/cropping `size` presets. */
 function singleImageLayout(imgKey: string, mode: string, alt: string): any {
+  const math = /^botmux-math:(\d{1,3})x(\d{1,3})$/.exec(alt);
+  if (math && +math[1] >= 1 && +math[1] <= 560 && +math[2] >= 1 && +math[2] <= 600) {
+    return {
+      tag: 'img', img_key: imgKey, alt: { tag: 'plain_text', content: 'Formula' },
+      size: `${math[1]}px ${math[2]}px`, scale_type: 'crop_center',
+      corner_radius: '0px', transparent: true, preview: true,
+    };
+  }
   const img = {
     tag: 'img', img_key: imgKey, alt: { tag: 'plain_text', content: alt },
     scale_type: 'fit_horizontal', preview: true,
@@ -1835,7 +1843,7 @@ function splitImageRowSegments(input: string, imageMode = 'fit_horizontal'): Bod
     }
     // Only promote standalone images for an explicit size override. Keep the
     // legacy Markdown output, inline prose, code blocks, and image grids intact.
-    if (!fenceChar && imageMode !== 'fit_horizontal') {
+    if (!fenceChar && (imageMode !== 'fit_horizontal' || line.includes('![botmux-math:'))) {
       const single = line.match(/^ {0,3}!\[([^\]]*)\]\(([^)\s]+)\)\s*$/);
       if (single && FEISHU_IMG_KEY.test(single[2]) && allImagesAreRealTokens(line, lineStart)) {
         flush();

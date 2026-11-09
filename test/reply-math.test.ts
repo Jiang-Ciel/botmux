@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { replyMathSpans, resolveReplyMath } from '../src/im/lark/reply-math.js';
 import { renderReplyMath } from '../src/im/lark/reply-math-render.js';
 import { buildCanonicalFinalReplyCard } from '../src/im/lark/md-card.js';
@@ -24,7 +25,7 @@ describe('LaTeX reply rendering', () => {
     expect(replyMathSpans(String.raw`start \[x+y`)).toEqual([]);
     expect(replyMathSpans('$x\ny$')).toEqual([]);
     expect(replyMathSpans(`$$${'x'.repeat(2049)}$$`)).toEqual([]);
-    expect(replyMathSpans(Array(20).fill('$x$').join(' '))).toHaveLength(8);
+    expect(replyMathSpans(Array(150).fill('$x$').join(' '))).toHaveLength(128);
   });
   it('renders and uploads once per identical expression and builds native image elements', async () => {
     const upload = vi.fn(async () => 'img_v3_formula');
@@ -65,8 +66,40 @@ describe('LaTeX reply rendering', () => {
       const ctx = createCanvas(image.width, image.height).getContext('2d');
       ctx.drawImage(image, 0, 0);
       const pixels = ctx.getImageData(0, 0, image.width, image.height).data;
-      expect(pixels.some((value, index) => index % 4 !== 3 && value < 100)).toBe(true);
+      expect(pixels.some((value, index) => index % 4 === 0 && value < 100 && pixels[index + 3] > 0)).toBe(true);
     }
+  });
+  it('renders the complete reported MoE reply, including formulas after the eighth span', async () => {
+    const original = readFileSync(new URL('./fixtures/moe-formulas.md', import.meta.url), 'utf8');
+    const spans = replyMathSpans(original);
+    expect(spans.length).toBeGreaterThan(8);
+    const upload = vi.fn(async (_bytes: Buffer) => `img_v3_formula_${upload.mock.calls.length}`);
+    const markdown = await resolveReplyMath(original, { owns: () => true, upload });
+    expect(replyMathSpans(markdown)).toEqual([]);
+    expect(markdown).not.toContain('```latex');
+    const card = JSON.parse(buildCanonicalFinalReplyCard({ markdown }));
+    const images = card.body.elements.filter((e: any) => e.tag === 'img');
+    expect(images).toHaveLength(spans.length);
+    for (const image of images) {
+      expect(image.scale_type).toBe('crop_center');
+      expect(image.size).toMatch(/^\d+px \d+px$/);
+      expect(image.mode).toBeUndefined();
+    }
+    // Short variable names must not become full-width banners.
+    expect(images.some((image: any) => Number(image.size.split('px')[0]) < 50)).toBe(true);
+    expect(images.some((image: any) => Number(image.size.split('px')[0]) > 100)).toBe(true);
+  });
+  it('matches image display size to PNG aspect ratio without upscaling small formulas', async () => {
+    const upload = vi.fn(async (_bytes: Buffer) => 'img_v3_size');
+    const markdown = await resolveReplyMath(String.raw`$$\frac{a}{b}$$`, { owns: () => true, upload });
+    const bytes = upload.mock.calls[0][0] as Buffer;
+    const card = JSON.parse(buildCanonicalFinalReplyCard({ markdown }));
+    const image = card.body.elements.find((e: any) => e.tag === 'img');
+    const [width, height] = image.size.match(/\d+/g).map(Number);
+    expect(width).toBe(Math.round(bytes.readUInt32BE(16) / 2));
+    expect(height).toBe(Math.round(bytes.readUInt32BE(20) / 2));
+    expect(image.preview).toBe(true);
+    expect(image.transparent).toBe(true);
   });
   it('rejects unknown commands and oversized raster dimensions', async () => {
     await expect(renderReplyMath(String.raw`\notACommand{x}`, false)).rejects.toThrow();

@@ -41,8 +41,6 @@ export async function renderReplyMath(latex: string, display: boolean): Promise<
   const image = await loadImage(Buffer.from(svg));
   const canvas = createCanvas(width + 24, height + 24);
   const context = canvas.getContext('2d');
-  context.fillStyle = '#ffffff';
-  context.fillRect(0, 0, canvas.width, canvas.height);
   context.drawImage(image, 12, 12, width, height);
   return canvas.toBuffer('image/png');
 }
