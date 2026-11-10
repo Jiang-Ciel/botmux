@@ -1460,6 +1460,18 @@ export interface SessionGroupConfig {
   avatar?: 'auto' | 'off';
 }
 
+export function normalizeAgentRouter(raw: unknown): BotConfig['agentRouter'] {
+  if (raw === undefined) return undefined;
+  if (raw === false) return false;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('agentRouter must be false or an object');
+  const entry = raw as Record<string, unknown>;
+  if (Object.keys(entry).some(key => !['executable', 'model'].includes(key))) throw new Error('unknown agentRouter option');
+  for (const key of ['executable', 'model']) {
+    if (entry[key] !== undefined && (typeof entry[key] !== 'string' || !(entry[key] as string).trim())) throw new Error(`invalid agentRouter ${key}`);
+  }
+  return { executable: entry.executable as string | undefined, model: entry.model as string | undefined };
+}
+
 export interface BotConfig {
   larkAppId: string;
   larkAppSecret: string;
@@ -1585,6 +1597,8 @@ export interface BotConfig {
    * `modelChoices` for the curated candidates surfaced in `botmux setup`.
    */
   model?: string;
+  /** Ordinary human messages use a hidden router by default; false restores direct execution. */
+  agentRouter?: false | { executable?: string; model?: string };
   /** Experimental TraeX-only ordered model allowlist used when model=`auto`.
    * The first entry is the core model; later entries are capacity fallbacks.
    * Missing keeps the feature off. */
@@ -4283,6 +4297,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.launchShell.trim()
         : undefined,
       model,
+      agentRouter: normalizeAgentRouter(entry.agentRouter),
       traexAutoModel,
       groupDefaultModels: normalizeGroupDefaultModels(entry.groupDefaultModels),
       groupSerialInput: normalizeGroupSerialInput(entry.groupSerialInput),

@@ -47,6 +47,9 @@ import { readFileSync, readdirSync, existsSync, mkdirSync, unlinkSync, realpathS
 import { installDaemonRejectionGuard } from './utils/daemon-rejection-guard.js';
 import { getLarkConnectionHealth, type LarkConnectionHealth } from './im/lark/transport/connection-health.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
+import { DefaultRouter, canonicalRouterProjects, routerConversation, routerExecutionFacts } from './services/default-router.js';
+import { PiRouterProvider } from './services/default-router-pi.js';
+import { resolvePiModel } from './adapters/cli/pi-model.js';
 import { readPeerCrossRef } from './services/peer-cross-ref-store.js';
 import { normalizeBotsInfoRouteEntries } from './services/bots-info-shape.js';
 import { createBotProfileRefresher } from './services/bot-profile-refresh.js';
@@ -26419,6 +26422,63 @@ function handleDocumentAskTextReply(data: any, ctx: RoutingContext): boolean {
   });
 }
 
+const defaultRouters = new Map<string, { signature: string; router: DefaultRouter; provider: PiRouterProvider }>();
+process.once('exit', () => { for (const entry of defaultRouters.values()) entry.provider.close(); });
+async function routeOrdinaryHuman(input: {
+  ctx: RoutingContext; data: any; text: string; command: string; resources: MessageResource[];
+  project?: string; skip?: boolean;
+}): Promise<import('./services/default-router.js').RouterResult | undefined> {
+  const { ctx, data } = input;
+  const cfg = getBot(ctx.larkAppId).config;
+  const owner = data?.sender?.sender_id?.open_id as string | undefined;
+  const ds = activeSessions.get(sessionKey(ctx.runtimeRoutingAnchor ?? ctx.anchor, ctx.larkAppId));
+  if (cfg.agentRouter === false || input.skip || !owner || data?.sender?.sender_type !== 'user'
+    || input.command.startsWith('/') || !input.text.trim() || ctx.messageListener || ctx.commandTrigger
+    || ctx.completionProposalContinuation || ctx.cascadeBodyReentry || ctx.effortTaskReentry
+    || ctx.runtimeRoutingAnchor || ctx.vcMeetingImTurnOrigin || ds?.adoptedFrom
+    || ds?.pendingRepo || ds?.tuiPromptCardId || ds?.agentAttention
+    || ds?.session.workflowNode) return undefined;
+  if (ds && data?.sender?.sender_type === 'user' && ds.session.ownerOpenId && ds.session.ownerOpenId !== owner) {
+    return { kind: 'reply', text: '该执行会话属于其他请求者，请另开话题收集和执行你的任务。' };
+  }
+  // Attachments must not be summarized away or silently dropped by a text-only router.
+  if (input.resources.length) {
+    return { kind: 'reply', text: '首版 Router 暂不分析附件。请先用文字明确项目与任务；执行阶段的附件请通过执行会话的受管交互提交。' };
+  }
+  const options = cfg.agentRouter || {};
+  const env = { ...process.env, ...cfg.env };
+  const executable = options.executable ?? (cfg.cliId === 'pi' ? cfg.cliPathOverride : undefined) ?? 'pi';
+  const model = resolvePiModel(options.model ?? (cfg.cliId === 'pi' ? cfg.model : undefined), { env });
+  const modelFlag = model.kind === 'none' ? undefined : model.flag;
+  const signature = JSON.stringify([executable, modelFlag, cfg.env]);
+  const key = `${ctx.larkAppId}:${owner}`;
+  let entry = defaultRouters.get(key);
+  if (!entry || entry.signature !== signature) {
+    entry?.provider.close();
+    const provider = new PiRouterProvider({ executable, model: modelFlag, env, owner,
+      cwd: join(config.session.dataDir, 'agent-router', 'internal') });
+    entry = { signature, provider, router: new DefaultRouter(join(config.session.dataDir, 'agent-router'), provider) };
+    defaultRouters.set(key, entry);
+  }
+  const pinned = ds ? ds.workingDir : (await resolvePinnedWorkingDir({ scope: ctx.scope, anchor: ctx.anchor,
+    chatId: ctx.chatId, chatType: ctx.chatType, larkAppId: ctx.larkAppId })).pinnedWorkingDir;
+  const projects = canonicalRouterProjects([input.project ?? pinned ?? cfg.workingDir ?? '', ...(cfg.workingDirs ?? [])]);
+  return entry.router.handle({
+    conversation: routerConversation(ctx.larkAppId, ctx.chatId, ctx.scope, ctx.anchor, owner),
+    owner: `${ctx.larkAppId}:${owner}`, messageId: ctx.messageId, text: input.text, controlText: input.command, projects,
+    execution: ds ? routerExecutionFacts(ds) : undefined,
+    projectBusy: project => [...activeSessions.values()].some(other => other !== ds
+      && canonicalRouterProjects([other.workingDir ?? ''])[0] === project
+      && (routerExecutionFacts(other).busy || routerExecutionFacts(other).waiting)),
+  });
+}
+async function finishOrdinaryRouter(ctx: RoutingContext, data: any, result: import('./services/default-router.js').RouterResult | undefined): Promise<void> {
+  if (result?.kind !== 'dispatch') return;
+  const entry = defaultRouters.get(`${ctx.larkAppId}:${data?.sender?.sender_id?.open_id}`);
+  const ds = activeSessions.get(sessionKey(ctx.runtimeRoutingAnchor ?? ctx.anchor, ctx.larkAppId));
+  await entry?.router.finish(result.attemptId, ds?.session.sessionId, !!ctx.ingressAdmission?.admitted);
+}
+
 async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<void> {
   if (feedbackMaintenanceActive(config.session.dataDir)) throw new Error('feedback_storage_maintenance');
   // Before any turn identity is published: the platform credential path keys on
@@ -26789,7 +26849,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // legacy model prompt. Codex App clean-input must keep those original bytes
   // as the visible UserMessage and move the generated skill prompt into hidden
   // untrusted context.
-  const codexAppVisibleText = content;
+  let codexAppVisibleText = content;
   let workflowGrillPrompt: string | undefined;
   const newTopicGrill = parseWorkflowGrillTrigger(cmdContent);
   if (newTopicGrill) {
@@ -26858,6 +26918,17 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   })) {
     return;
   }
+  const routerResult = await routeOrdinaryHuman({ ctx, data, text: content, command: cmdContent, resources,
+    project: topicSpec?.workingDir, skip: isBareForceTopic || !!forceTopic || !!workflowGrillPrompt || isForeignBotSender });
+  if (routerResult?.kind === 'reply') { await sessionReply(anchor, routerResult.text, 'text', larkAppId); return; }
+  if (routerResult?.kind === 'dispatch') {
+    const gate = await evaluatePromptGate('prompt.submit', { larkAppId, chatId, chatType, anchor, messageId,
+      senderOpenId, promptContent: routerResult.instruction, promptAttachments: [] });
+    if (!gate.allowed) { await sessionReply(anchor, '已批准需求被当前内容策略拒绝，尚未执行；请核查任务和策略。', 'text', larkAppId); return; }
+    content = routerResult.instruction; parsed.content = content; codexAppVisibleText = content;
+    topicSpec = { ok: true, workingDir: routerResult.project };
+  }
+  try {
   // 种子 = 闸刚校验的 content。纯 `/t` 与会话群出生轮不过 prompt 闸；免@ 命令模板、
   // `/workflow` 改写与监听器包装的 content 不是用户在说事——这几类都不拿来命名。
   if (groupAutoTitlePending && !isBareForceTopic && !sessionGroupAlreadyCharged
@@ -27381,6 +27452,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     await primaryAdmission?.waitIfMarginal();
     logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
   }
+  } finally { await finishOrdinaryRouter(ctx, data, routerResult); }
 }
 
 // 主动开工 — 场景①: in-flight lock so two near-simultaneous `bot.added` events
@@ -29184,6 +29256,10 @@ async function handleThreadReplyAdmitted(
     return;
   }
   const threadChatId = ctxChatId ?? data?.message?.chat_id;
+  const attentionAnswerSession = activeSessions.get(runtimeSessionKey);
+  const answeringAgentAttention = !!attentionAnswerSession?.agentAttention
+    && !isForeignBot && !isBotSenderType
+    && attentionAnswerSession.session.ownerOpenId === threadSenderOpenId;
   const clearAgentAttentionForHumanInbound = (): void => {
     if (isForeignBot || isBotSenderType) return;
     const ds = activeSessions.get(runtimeSessionKey);
@@ -29591,6 +29667,21 @@ async function handleThreadReplyAdmitted(
     return;
   }
   if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
+  const routerResult = await routeOrdinaryHuman({ ctx, data, text: content, command: cmdContent, resources,
+    skip: answeringAgentAttention || !!prepared || !!replay || !!workflowHandoff || isForeignBot });
+  if (routerResult?.kind === 'reply') { await sessionReply(anchor, routerResult.text, 'text', larkAppId); return; }
+  if (routerResult?.kind === 'dispatch') {
+    if (dsPre && canonicalRouterProjects([dsPre.workingDir ?? ''])[0] !== routerResult.project) {
+      await sessionReply(anchor, '目标项目与当前执行会话不一致，派发已停止并保留栅栏，请核查后另开话题。', 'text', larkAppId);
+      return;
+    }
+    const gate = await evaluatePromptGate('prompt.submit', { larkAppId, chatId: ctxChatId, chatType: ctxChatType,
+      anchor, messageId: parsed.messageId, senderOpenId: threadSenderOpenId,
+      promptContent: routerResult.instruction, promptAttachments: [] });
+    if (!gate.allowed) { await sessionReply(anchor, '已批准需求被当前内容策略拒绝，尚未执行；请核查任务和策略。', 'text', larkAppId); return; }
+    content = routerResult.instruction; parsed.content = content; promptContent = content;
+  }
+  try {
   // Topic session continuity (core/topic-session-continuity.ts). A topic whose
   // session was closed used to get a brand-new CLI session on the next message,
   // so a lead's `dispatch --into` follow-up reached an executor with no memory
@@ -30207,7 +30298,9 @@ async function handleThreadReplyAdmitted(
     // A workflow node of a run approved with --working-dir starts exactly in
     // that (just range-checked) directory instead (design §15.4).
     const workflowStart = workflowNodePinnedStart(workflowAdmission);
-    const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = workflowStart
+    const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = (routerResult?.kind === 'dispatch'
+      ? { pinnedWorkingDir: routerResult.project, oncallEntry: undefined, inheritedFrom: null, pinnedFromBotDefault: false }
+      : workflowStart)
       ?? await resolvePinnedWorkingDir({
         scope,
         anchor,
@@ -31240,6 +31333,7 @@ async function handleThreadReplyAdmitted(
       clearInitialStartClaim(ds!, initialStartClaimToken);
     }
   }
+  } finally { await finishOrdinaryRouter(ctx, data, routerResult); }
 }
 
 /**
