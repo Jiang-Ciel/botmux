@@ -22,6 +22,7 @@ export type NavItem = {
 export const BOT_DEFAULTS_ALIASES: readonly string[] = ['机器人配置', '机器人设置', 'bot settings', 'bot configuration'];
 
 export const NAV_ITEMS: NavItem[] = [
+  { id: 'router', href: '#/router', label: 'Router', manage: true, icon: <path d="M2 3h12v10H2zM5 6h6M5 9h4" /> },
   {
     id: 'overview',
     href: '#/',
@@ -115,7 +116,7 @@ export const NAV_ITEMS: NavItem[] = [
  */
 export const NAV_GROUPS: Array<{ id: string; labelKey: string; items: string[] }> = [
   { id: 'overview', labelKey: 'nav.group.overview', items: ['overview'] },
-  { id: 'collab', labelKey: 'nav.group.collab', items: ['sessions', 'decision-board', 'agent-workbench', 'groups', 'schedules', 'workflows'] },
+  { id: 'collab', labelKey: 'nav.group.collab', items: ['router', 'sessions', 'decision-board', 'agent-workbench', 'groups', 'schedules', 'workflows'] },
   { id: 'workforce', labelKey: 'nav.group.workforce', items: ['roles', 'skills', 'customization', 'message-listeners', 'doc-watches', 'bot-defaults', 'agents'] },
   { id: 'analytics', labelKey: 'nav.group.analytics', items: ['monitoring', 'insights', 'feedback'] },
   { id: 'manage', labelKey: 'nav.group.manage', items: ['terminal', 'connectors', 'plugins', 'whiteboards', 'settings'] },

@@ -9,7 +9,7 @@ const fixture = vi.hoisted(() => ({ spawn: vi.fn() }));
 vi.mock('../src/services/constrained-invocation/native-process.js', () => ({ spawnOwnedModelProcess: fixture.spawn }));
 import { PiRouterProvider } from '../src/services/default-router-pi.js';
 import type { RouterContext } from '../src/services/default-router.js';
-const answer = { action: 'clarify', message: 'which project?', title: 'task', project: '', instruction: '' };
+const answer = { action: 'clarify', message: 'which project?', title: '', project: '', instruction: '' };
 function setup() {
   const stdout = new PassThrough(); const child = new EventEmitter() as any;
   let command: any;
@@ -49,6 +49,16 @@ describe('hidden Pi RPC transport', () => {
     f.event({ type: 'message_end', message: { role: 'assistant', stopReason: 'error', content: [] } });
     f.event({ type: 'agent_settled' }); await expect(next).rejects.toThrow();
     f.provider.close();
+  });
+  it('emits model ACK and activity as safe progress without revealing text deltas', async () => {
+    const f = setup(); const stages: string[] = [];
+    const request = f.provider.decide(f.context, AbortSignal.timeout(1000), stage => stages.push(stage));
+    expect(stages).toEqual(['submitted']);
+    f.event({ type: 'response', id: f.command().id, success: true });
+    f.event({ type: 'message_update', assistantMessageEvent: { type: 'thinking_delta', delta: 'PRIVATE' } });
+    f.event({ type: 'message_end', message: { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: JSON.stringify(answer) }] } });
+    f.event({ type: 'agent_settled' }); await request;
+    expect(stages).toEqual(['submitted', 'analyzing', 'analyzing']); expect(JSON.stringify(stages)).not.toContain('PRIVATE'); f.provider.close();
   });
   it('aborts an unresponsive run and closes active waiters', async () => {
     const f = setup(); const controller = new AbortController();

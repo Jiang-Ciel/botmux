@@ -1,3 +1,4 @@
+import { listRouterProgress } from '../services/router-progress.js';
 import { readOncallDeploymentEnv } from '../services/oncall-deployment-config.js';
 import { loadOncallPresetOptions } from '../services/oncall-preset-options.js';
 import { loadOncallGroupTarget, readOncallGroupSettings, saveOncallGroupTarget } from '../services/oncall-group-client.js';
@@ -1885,6 +1886,11 @@ ipcRoute('POST', DEVICE_ISOLATION_RELEASE_PATH, (req, res) =>
   handleDeviceIsolationActivationRoute(req, res, releaseDeviceIsolationActivation));
 
 // ─── Pending asks (trusted Desktop/dashboard operator only) ─────────────────
+
+ipcRoute('GET', '/api/router/analyses', (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  return jsonRes(res, 200, { analyses: listRouterProgress(join(config.session.dataDir, 'agent-router')) });
+});
 
 ipcRoute('GET', '/api/asks/pending', (req, res) => {
   if (!isTrustedHostIpcRequest(req)) {

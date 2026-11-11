@@ -6142,7 +6142,7 @@ export async function postTurnStartingCard(
     // Reserve the turn before the CLI can call `botmux send`. Its reply uses
     // the same durable record even while the first card POST is in flight.
     replyPost = updateTurnReplyCard(ds, turnId, { kind: 'refresh' },
-      (body, type, uuid, beforeWrite) => sessionReply(sessionAnchorId(ds), body, type, ds.larkAppId, turnId, { uuid, beforeWrite }),
+      (body, type, uuid, beforeWrite) => sessionReply(sessionAnchorId(ds), body, type, ds.larkAppId, turnId, { uuid, beforeWrite, sourceSessionId: ds.session.sessionId }),
       { dispatchAttempt: replyCardDispatchAttempt(ds, turnId) })
       .then(result => !!result).catch(error => {
         logger.warn(`[reply-card] initial card: ${error instanceof Error ? error.message : String(error)}`);
@@ -11960,7 +11960,7 @@ function persistedActiveSessionKey(
   // normal chat anchor — this must stay in lockstep with activeSessionKey()
   // (core/types.ts) so a restored meeting row re-registers at the SAME slot the
   // live path uses. The vcMeetingReceiver marker is delivery metadata only.
-  return sessionKey(storedSessionAnchorId(session), larkAppId);
+  return sessionKey(session.routerTask ? `router-task:${session.routerTask.taskId}:${session.sessionId}` : storedSessionAnchorId(session), larkAppId);
 }
 
 /**

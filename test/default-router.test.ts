@@ -16,6 +16,24 @@ function setup() {
   return { root, project, decide, router, input };
 }
 describe('default hidden router', () => {
+  it.each(['clarify', 'reply'] as const)('returns %s messages with an empty title without dispatching', async action => {
+    const { root, router, input, decide } = setup();
+    const message = 'What would you like to test?';
+    decide.mockResolvedValueOnce({ action, message, title: '', project: '', instruction: '' });
+    expect(await router.handle({ ...input, text: '测试' })).toEqual({ kind: 'reply', text: message });
+    const task = JSON.parse(readFileSync(join(root, 'ledger', 'ledger.json'), 'utf8')).tasks[0];
+    expect(task.state).toBe('collecting');
+    expect(task.attempt).toBeUndefined();
+    expect(task.history.at(-1)).toEqual({ role: 'assistant', text: message });
+  });
+  it('does not accept a proposal without a title', async () => {
+    const { root, router, input, decide, project } = setup();
+    decide.mockResolvedValueOnce({ action: 'propose', message: 'ready', title: '', project, instruction: 'implement' });
+    expect((await router.handle(input)).kind).toBe('reply');
+    const task = JSON.parse(readFileSync(join(root, 'ledger', 'ledger.json'), 'utf8')).tasks[0];
+    expect(task.state).toBe('collecting');
+    expect(task.history).toHaveLength(1);
+  });
   it('requires explicit approval, persists the dispatch fence and never replays unknown submissions', async () => {
     const { root, router, input, decide } = setup();
     expect((await router.handle(input)).kind).toBe('reply');
@@ -54,7 +72,7 @@ describe('default hidden router', () => {
     await router.handle({ ...input, messageId: 'edit', text: 'change scope' });
     const result = await router.handle({ ...input, messageId: 'approve', text: '批准执行' });
     expect(result.kind).toBe('reply');
-    expect(decide).toHaveBeenCalledTimes(3);
+    expect(decide).toHaveBeenCalledTimes(2);
   });
   it('blocks a second task in the same project across ledger instances', async () => {
     const { root, router, input, decide } = setup();

@@ -48,6 +48,7 @@ import { installDaemonRejectionGuard } from './utils/daemon-rejection-guard.js';
 import { getLarkConnectionHealth, type LarkConnectionHealth } from './im/lark/transport/connection-health.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { DefaultRouter, canonicalRouterProjects, routerConversation, routerExecutionFacts } from './services/default-router.js';
+import { interruptRouterProgress, routerProgressCard, type RouterProgress } from './services/router-progress.js';
 import { PiRouterProvider } from './services/default-router-pi.js';
 import { resolvePiModel } from './adapters/cli/pi-model.js';
 import { readPeerCrossRef } from './services/peer-cross-ref-store.js';
@@ -1093,7 +1094,6 @@ import {
   registerHostAsk,
   restorePersistedAsks as restorePersistedAsksBroker,
   startHookAskReclaim,
-  findPendingAskByAnchor,
   listPendingAsksByAnchor,
   askAnswerActorFor,
   submitCustomReply,
@@ -5079,6 +5079,12 @@ async function sessionReply(
       for (const s of activeSessions.values()) {
         if (sessionAnchorId(s) === anchor) { ds = s; break; }
       }
+    }
+  }
+  if (ds?.session.routerTask && msgType === 'text') {
+    content = `【${ds.session.routerTask.title}｜${ds.session.routerTask.taskId.slice(0, 8)}】\n${content}`;
+    if (!opts?.quoteMessageId && ds.scope === 'chat' && (!opts?.replyTarget || opts.replyTarget.mode === 'plain')) {
+      opts = { ...opts, quoteMessageId: ds.session.routerTask.sourceMessageId };
     }
   }
   const appId = larkAppId ?? ds?.larkAppId ?? getAllBots()[0]?.config.larkAppId;
@@ -26424,6 +26430,17 @@ function handleDocumentAskTextReply(data: any, ctx: RoutingContext): boolean {
 
 const defaultRouters = new Map<string, { signature: string; router: DefaultRouter; provider: PiRouterProvider }>();
 process.once('exit', () => { for (const entry of defaultRouters.values()) entry.provider.close(); });
+let routerReconcilePending = false;
+const routerReconcileTimer = setInterval(() => {
+  if (routerReconcilePending || !defaultRouters.size) return;
+  routerReconcilePending = true;
+  const facts = [...activeSessions.values()].map(routerExecutionFacts);
+  // All providers share this daemon ledger. Reconcile once, independently of input analysis.
+  void defaultRouters.values().next().value!.router.reconcile(facts)
+    .catch(() => logger.warn('[router] execution reconciliation failed'))
+    .finally(() => { routerReconcilePending = false; });
+}, 5000);
+routerReconcileTimer.unref?.();
 async function routeOrdinaryHuman(input: {
   ctx: RoutingContext; data: any; text: string; command: string; resources: MessageResource[];
   project?: string; skip?: boolean;
@@ -26441,6 +26458,18 @@ async function routeOrdinaryHuman(input: {
   if (ds && data?.sender?.sender_type === 'user' && ds.session.ownerOpenId && ds.session.ownerOpenId !== owner) {
     return { kind: 'reply', text: '该执行会话属于其他请求者，请另开话题收集和执行你的任务。' };
   }
+  // In a collection window only a quoted managed question is an answer.
+  // Unquoted new requests must not be swallowed by an unrelated waiting executor.
+  const parentId = data?.message?.parent_id;
+  if (parentId && !input.resources.length) {
+    const asks = listPendingAsksByAnchor({ larkAppId: ctx.larkAppId, chatId: ctx.chatId, anchor: ctx.anchor });
+    const quotedAsk = asks.find(ask => ask.cardMessageId === parentId);
+    if (quotedAsk) {
+      const outcome = submitCustomReply({ askId: quotedAsk.askId, by: owner, text: input.text,
+        actor: { senderType: 'user', memberUnionId: data?.sender?.sender_id?.union_id } });
+      if (outcome === 'accepted') return { kind: 'reply', text: '回答已返回对应任务的等待问答。' };
+    }
+  }
   // Attachments must not be summarized away or silently dropped by a text-only router.
   if (input.resources.length) {
     return { kind: 'reply', text: '首版 Router 暂不分析附件。请先用文字明确项目与任务；执行阶段的附件请通过执行会话的受管交互提交。' };
@@ -26455,6 +26484,7 @@ async function routeOrdinaryHuman(input: {
   let entry = defaultRouters.get(key);
   if (!entry || entry.signature !== signature) {
     entry?.provider.close();
+    interruptRouterProgress(join(config.session.dataDir, 'agent-router'), key);
     const provider = new PiRouterProvider({ executable, model: modelFlag, env, owner,
       cwd: join(config.session.dataDir, 'agent-router', 'internal') });
     entry = { signature, provider, router: new DefaultRouter(join(config.session.dataDir, 'agent-router'), provider) };
@@ -26463,14 +26493,75 @@ async function routeOrdinaryHuman(input: {
   const pinned = ds ? ds.workingDir : (await resolvePinnedWorkingDir({ scope: ctx.scope, anchor: ctx.anchor,
     chatId: ctx.chatId, chatType: ctx.chatType, larkAppId: ctx.larkAppId })).pinnedWorkingDir;
   const projects = canonicalRouterProjects([input.project ?? pinned ?? cfg.workingDir ?? '', ...(cfg.workingDirs ?? [])]);
-  return entry.router.handle({
+  let latest: RouterProgress | undefined;
+  let cardId: string | undefined;
+  let cardWork = Promise.resolve();
+  let lastPaint = 0;
+  const paintProgress = (force = false) => {
+    if (!latest || (!force && Date.now() - lastPaint < 3000)) return;
+    lastPaint = Date.now(); const value = structuredClone(latest);
+    cardWork = cardWork.then(async () => {
+      if (cardId) await updateMessage(ctx.larkAppId, cardId, JSON.stringify(routerProgressCard(value)));
+      else cardId = await replyMessage(ctx.larkAppId, ctx.messageId, JSON.stringify(routerProgressCard(value)), 'interactive', ctx.scope === 'thread');
+    }).catch(() => { logger.warn('[router] progress card delivery failed'); });
+  };
+  const timer = setInterval(() => { if (latest && !latest.finishedAt) paintProgress(); }, 5000); timer.unref?.();
+  let result: import('./services/default-router.js').RouterResult;
+  try { result = await entry.router.handle({
     conversation: routerConversation(ctx.larkAppId, ctx.chatId, ctx.scope, ctx.anchor, owner),
     owner: `${ctx.larkAppId}:${owner}`, messageId: ctx.messageId, text: input.text, controlText: input.command, projects,
-    execution: ds ? routerExecutionFacts(ds) : undefined,
-    projectBusy: project => [...activeSessions.values()].some(other => other !== ds
-      && canonicalRouterProjects([other.workingDir ?? ''])[0] === project
+    onProgress: value => { latest = value; paintProgress(!!value.finishedAt); },
+    executions: [...activeSessions.values()].filter(other => other.larkAppId === ctx.larkAppId).map(routerExecutionFacts),
+    projectBusy: project => [...activeSessions.values()].some(other =>
+      canonicalRouterProjects([other.workingDir ?? ''])[0] === project
       && (routerExecutionFacts(other).busy || routerExecutionFacts(other).waiting)),
+  }); } finally { clearInterval(timer); }
+  if (result.kind !== 'dispatch') return result;
+  // Dispatch by task identity, never by the collection window's anchor slot.
+  const gate = await evaluatePromptGate('prompt.submit', { larkAppId: ctx.larkAppId, chatId: ctx.chatId,
+    chatType: ctx.chatType, anchor: ctx.anchor, messageId: ctx.messageId, senderOpenId: owner,
+    promptContent: result.instruction, promptAttachments: [] });
+  if (!gate.allowed) return { kind: 'reply', text: '已批准需求被内容策略拒绝，派发未执行；保留记录供核查。' };
+  const session = sessionStore.createSession(ctx.chatId, ctx.scope === 'thread' ? ctx.anchor : ctx.messageId,
+    result.title ?? 'Router task', ctx.chatType, undefined, { source: 'ordinary-feishu' });
+  session.larkAppId = ctx.larkAppId; session.scope = ctx.scope;
+  session.ownerOpenId = owner; session.ownerUnionId = data?.sender?.sender_id?.union_id;
+  session.creatorOpenId = owner; session.lastCallerOpenId = owner; session.workingDir = result.project;
+  session.quoteTargetId = result.sourceMessageId ?? ctx.messageId; session.quoteTargetSenderOpenId = owner;
+  session.routerTask = { taskId: result.taskId!, attemptId: result.attemptId,
+    sourceMessageId: result.sourceMessageId ?? ctx.messageId, title: result.title ?? 'Router task' };
+  session.nativeSessionTitle = result.title; session.nativeSessionTitleUserDefined = true;
+  stampHumanActivity(session, Date.now()); sessionStore.updateSession(session);
+  const executor: DaemonSession = { session, worker: null, workerPort: null, workerToken: null,
+    larkAppId: ctx.larkAppId, chatId: ctx.chatId, chatType: ctx.chatType, scope: ctx.scope,
+    spawnedAt: Date.now(), cliVersion: 'unknown', lastMessageAt: Date.now(), hasHistory: false,
+    workingDir: result.project, ownerOpenId: owner };
+  beginReplyTargetTurn(executor, ctx.scope === 'thread' ? ctx.anchor : undefined, ctx.messageId,
+    new Date().toISOString(), { senderOpenId: owner, sourceMessageId: session.routerTask.sourceMessageId,
+      participants: [{ openId: owner, isBot: false }], participantsIncomplete: false, inThread: ctx.scope === 'thread' });
+  sessionStore.updateSession(session);
+  const registration = await claimNewDaemonSession(activeSessions, executor);
+  if (!registration.accepted) return { kind: 'reply', text: '执行会话注册未成功，派发记录已保留，不会自动重发。' };
+  const caller = await trustedCallerForInboundTurn(ctx.larkAppId, owner, session.ownerUnionId, false, ctx.messageId);
+  const sender = { openId: owner, type: 'user' as const };
+  const payload = buildNewTopicCliInput(
+    `任务：${result.title}\n对应用户请求消息：${session.routerTask.sourceMessageId}\n\n${result.instruction}`,
+    session.sessionId, cfg.cliId, cfg.cliPathOverride, undefined, undefined,
+    await getAvailableBots(ctx.larkAppId, ctx.chatId), undefined,
+    { name: getBot(ctx.larkAppId).botName, openId: getBot(ctx.larkAppId).botOpenId }, localeForBot(ctx.larkAppId), sender,
+    { larkAppId: ctx.larkAppId, chatId: ctx.chatId, trustedCaller: caller });
+  const router = entry.router;
+  await router.bind(result.attemptId, session.sessionId);
+  forkWorker(executor, payload, { turnId: ctx.messageId, trustedCaller: caller }, {
+    onAdmission: admission => {
+      if (admission === 'accepted') {
+        markIngressAdmitted(ctx);
+        void router.finish(result.attemptId, session.sessionId, true).catch(() => logger.error('[router] dispatch settlement persistence failed'));
+      }
+    },
   });
+  return { kind: 'reply', text: `任务已进入派发：${result.title}\n任务 ID：${result.taskId}\n后台 session：${session.sessionId}\n结果将回到本窗口，可继续提出其他需求。` };
+
 }
 async function finishOrdinaryRouter(ctx: RoutingContext, data: any, result: import('./services/default-router.js').RouterResult | undefined): Promise<void> {
   if (result?.kind !== 'dispatch') return;
@@ -29444,10 +29535,11 @@ async function handleThreadReplyAdmitted(
     isWorkflowGrillTrigger: !!threadGrill,
   });
   if (askCandidate) {
-    const candidates = listPendingAsksByAnchor({ larkAppId, chatId: askCandidate.chatId, anchor });
+    const candidates = listPendingAsksByAnchor({ larkAppId, chatId: askCandidate.chatId, anchor })
+      .filter(ask => !findActiveBySessionId(ask.sessionId)?.session.routerTask || parsed.parentId === ask.cardMessageId);
     const quoted = candidates.find(ask => !!ask.cardMessageId && parsed.parentId === ask.cardMessageId);
     const ambiguous = candidates.length > 1 && candidates.some(ask => ask.originKind === CODEX_ASYNC_ASK_ORIGIN);
-    const pendingAsk = quoted ?? (ambiguous ? undefined : findPendingAskByAnchor({ larkAppId, chatId: askCandidate.chatId, anchor }));
+    const pendingAsk = quoted ?? (ambiguous ? undefined : candidates[0]);
     if (ambiguous && !quoted) {
       await sessionReply(anchor, tr('card.ask.async_ambiguous', undefined, localeForBot(larkAppId)), 'text', larkAppId);
     }

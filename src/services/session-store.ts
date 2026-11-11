@@ -2181,6 +2181,7 @@ function persistRow(session: Session, modelPinWrite = false): void {
       // be erased by a stale metadata write or by changing workingDir.
       session = { ...session, workspaceRetirement: durable.workspaceRetirement };
     }
+    if (durable.routerTask) session = { ...session, routerTask: durable.routerTask };
     // Task continuation has its own compare-and-set writer. Metadata writers
     // holding an old row must neither erase a live task nor resurrect a stop.
     session = { ...session, deploymentContinuation: durable.deploymentContinuation };

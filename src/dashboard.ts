@@ -4958,6 +4958,21 @@ const server = createServer(async (req, res) => {
     }
 
     // Desktop / operator UI: aggregate pending ask-hooks across daemons.
+    if (req.method === 'GET' && url.pathname === '/api/router/analyses') {
+      // Router prompts may contain project-private information: host management only.
+      if (sessionBoardAudience !== 'management') return jsonRes(res, 403, { ok: false, error: 'management_required' });
+      const analyses: unknown[] = [];
+      await Promise.all(registry.list().map(async d => {
+        try {
+          const response = await fetchDaemonIpc(d.ipcPort, '/api/router/analyses', { signal: AbortSignal.timeout(2000) });
+          if (!response.ok) return;
+          const body = await response.json() as { analyses?: Array<{ owner: string }> };
+          analyses.push(...(body.analyses ?? []).filter(p => p.owner.startsWith(`${d.larkAppId}:`)).map(p => ({ ...p, botName: d.botName })));
+        } catch { /* offline daemon */ }
+      }));
+      return jsonRes(res, 200, { analyses });
+    }
+
     if (req.method === 'GET' && url.pathname === '/api/asks/pending') {
       const daemons = registry.list();
       const asks: unknown[] = [];

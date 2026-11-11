@@ -1209,7 +1209,7 @@ export function principalLaneRoutingAnchorId(
 export function runtimeSessionAnchorId(
   ds: Pick<DaemonSession, 'runtimeRoutingAnchor' | 'session' | 'scope' | 'chatId'>,
 ): string {
-  return ds.runtimeRoutingAnchor ?? sessionAnchorId(ds);
+  return ds.runtimeRoutingAnchor ?? (ds.session.routerTask ? `router-task:${ds.session.routerTask.taskId}:${ds.session.sessionId}` : sessionAnchorId(ds));
 }
 
 /** Storage key for the daemon-owned activeSessions map. A validated principal

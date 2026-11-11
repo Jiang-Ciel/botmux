@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import ts from 'typescript';
 import { DefaultRouter, canonicalRouterProjects, routerConversation, routerExecutionFacts } from '../src/services/default-router.js';
 import { resolvePiModel } from '../src/adapters/cli/pi-model.js';
+import { routerProgressCard, interruptRouterProgress } from '../src/services/router-progress.js';
 import { buildNewTopicCliInput } from '../src/core/session-manager.js';
 
 // Non-text assertion: execute the production daemon function with fake external
@@ -21,10 +22,10 @@ function load(name: string, scope: Record<string, any>) {
 function setup() {
   const root = mkdtempSync(join(tmpdir(), 'router-ingress-'));
   const handle = vi.fn(async () => ({ kind: 'reply', text: 'clarify' }));
-  const ds: any = { workingDir: root, session: { ownerOpenId: 'owner', sessionId: 's', status: 'active' }, worker: { killed: false }, workerReady: true, lastScreenStatus: 'idle' };
-  const scope = { getBot: () => ({ config: { workingDir: root } }), activeSessions: new Map([['anchor', ds]]),
+  const ds: any = { workingDir: root, session: { ownerOpenId: 'owner', sessionId: 's', status: 'active' }, worker: { killed: false }, workerReady: true, lastScreenStatus: 'idle', larkAppId: 'app' };
+  const scope = { getBot: () => ({ config: { workingDir: root, cliId: 'pi' } }), activeSessions: new Map([['anchor', ds]]),
     sessionKey: (anchor: string) => anchor, config: { session: { dataDir: root } },
-    DefaultRouter, canonicalRouterProjects, routerConversation, routerExecutionFacts, resolvePiModel, join,
+    routerProgressCard, interruptRouterProgress, DefaultRouter, canonicalRouterProjects, routerConversation, routerExecutionFacts, resolvePiModel, join,
     defaultRouters: new Map([['app:owner', { signature: JSON.stringify(['pi', undefined, undefined]), router: { handle } }]]) };
   const route = load('routeOrdinaryHuman', scope);
   const input = { ctx: { larkAppId: 'app', chatId: 'chat', scope: 'thread', anchor: 'anchor', messageId: 'm' },
@@ -35,7 +36,7 @@ describe('default router ordinary ingress', () => {
   it('preserves the host control lane and uses runtime-idle facts', async () => {
     const f = setup(); await f.route(f.input);
     const input = f.handle.mock.calls[0][0] as any;
-    expect(input.controlText).toBe('批准执行'); expect(input.execution.busy).toBe(false);
+    expect(input.controlText).toBe('批准执行'); expect(input.executions[0].busy).toBe(false);
     const other = { ...f.ds, session: { ...f.ds.session, sessionId: 'other' } };
     f.scope.activeSessions.set('other', other);
     const project = canonicalRouterProjects([f.ds.workingDir])[0];
@@ -50,6 +51,29 @@ describe('default router ordinary ingress', () => {
     delete f.ds.agentAttention;
     expect(await f.route({ ...f.input, skip: true })).toBeUndefined();
     expect(f.handle).not.toHaveBeenCalled();
+  });
+  it('dispatches to an independently registered task executor without reusing the visible anchor owner', async () => {
+    const f = setup();
+    const finish = vi.fn(async () => {}); const bind = vi.fn(async () => {});
+    f.handle.mockResolvedValueOnce({ kind: 'dispatch', instruction: 'approved work', project: f.ds.workingDir,
+      attemptId: 'attempt', taskId: 'task', title: '南京天气', sourceMessageId: 'original' } as any);
+    f.scope.defaultRouters.get('app:owner').router.finish = finish;
+    f.scope.defaultRouters.get('app:owner').router.bind = bind;
+    const createSession = vi.fn(() => ({ sessionId: 'independent', status: 'active' }));
+    const register = vi.fn(async () => ({ accepted: true }));
+    const fork = vi.fn((_ds, _payload, _turn, options) => { options.onAdmission('accepted'); return true; });
+    Object.assign(f.scope, {
+      evaluatePromptGate: async () => ({ allowed: true }), sessionStore: { createSession, updateSession: vi.fn() },
+      stampHumanActivity: vi.fn(), beginReplyTargetTurn: vi.fn(), claimNewDaemonSession: register,
+      trustedCallerForInboundTurn: async () => undefined, getAvailableBots: async () => [], localeForBot: () => 'zh',
+      buildNewTopicCliInput, forkWorker: fork, markIngressAdmitted: vi.fn(), logger: { warn: vi.fn(), error: vi.fn() },
+    });
+    const result = await f.route(f.input);
+    expect(result.kind).toBe('reply'); expect(result.text).toContain('independent');
+    const executor = register.mock.calls[0][1]; expect(executor.session.routerTask.taskId).toBe('task');
+    expect(executor.session.routerTask.sourceMessageId).toBe('original'); expect(executor).not.toBe(f.ds);
+    expect(f.scope.activeSessions.get('anchor')).toBe(f.ds);
+    expect(bind).toHaveBeenCalledWith('attempt', 'independent'); expect(finish).toHaveBeenCalledWith('attempt', 'independent', true);
   });
   it('delivers approved instruction in Codex clean input, not the approval keyword', () => {
     const instruction = 'Implement the confirmed task with tests';

@@ -71,6 +71,7 @@ function pageRoute<T extends Record<K, DashboardRouteRenderer>, K extends keyof 
 }
 
 export const dashboardRoutes: DashboardRoute[] = [
+  pageRoute('router', '#/router', () => import('./router-page.js'), 'renderRouterPage'),
   pageRoute(
     'agent-workbench-dock',
     '#/agent-workbench-dock',
