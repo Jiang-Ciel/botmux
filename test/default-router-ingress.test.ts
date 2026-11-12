@@ -6,7 +6,7 @@ import ts from 'typescript';
 import { DefaultRouter, canonicalRouterProjects, routerConversation, routerExecutionFacts } from '../src/services/default-router.js';
 import { resolvePiModel } from '../src/adapters/cli/pi-model.js';
 import { routerProgressCard, interruptRouterProgress } from '../src/services/router-progress.js';
-import { buildNewTopicCliInput } from '../src/core/session-manager.js';
+import { buildNewTopicCliInput, buildFollowUpCliInput } from '../src/core/session-manager.js';
 
 // Non-text assertion: execute the production daemon function with fake external
 // boundaries. The daemon module itself starts services and cannot be imported.
@@ -27,6 +27,7 @@ function setup() {
     sessionKey: (anchor: string) => anchor, config: { session: { dataDir: root } },
     routerProgressCard, interruptRouterProgress, DefaultRouter, canonicalRouterProjects, routerConversation, routerExecutionFacts, resolvePiModel, join,
     defaultRouters: new Map([['app:owner', { signature: JSON.stringify(['pi', undefined, undefined]), router: { handle } }]]) };
+  Object.assign(scope, { dispatchOrdinaryRouterTask: load('dispatchOrdinaryRouterTask', scope) });
   const route = load('routeOrdinaryHuman', scope);
   const input = { ctx: { larkAppId: 'app', chatId: 'chat', scope: 'thread', anchor: 'anchor', messageId: 'm' },
     data: { sender: { sender_type: 'user', sender_id: { open_id: 'owner' } } }, text: '@Bot 批准执行', command: '批准执行', resources: [] };
@@ -74,6 +75,59 @@ describe('default router ordinary ingress', () => {
     expect(executor.session.routerTask.sourceMessageId).toBe('original'); expect(executor).not.toBe(f.ds);
     expect(f.scope.activeSessions.get('anchor')).toBe(f.ds);
     expect(bind).toHaveBeenCalledWith('attempt', 'independent'); expect(finish).toHaveBeenCalledWith('attempt', 'independent', true);
+  });
+  it.each(['pi', 'codex-app', 'claude'])('continues the exact existing task session using %s without creating or forking a replacement', async cliId => {
+    const f = setup();
+    const bind = vi.fn(async () => {}); const finish = vi.fn(async () => {});
+    f.scope.defaultRouters.get('app:owner').router.bind = bind;
+    f.scope.defaultRouters.get('app:owner').router.finish = finish;
+    const executor: any = { ...f.ds, session: { ...f.ds.session, sessionId: 'original-session', routerTask: { taskId: 'task', attemptId: 'old' } } };
+    f.scope.activeSessions.set('executor', executor);
+    f.handle.mockResolvedValueOnce({ kind: 'dispatch', instruction: 'full supplemental code', project: f.ds.workingDir,
+      attemptId: 'continue-attempt', taskId: 'task', title: 'format', sessionId: 'original-session' } as any);
+    const createSession = vi.fn(); const fork = vi.fn(); const send = vi.fn(() => true);
+    Object.assign(f.scope, {
+      getBot: () => ({ config: { workingDir: f.ds.workingDir, cliId } }),
+      evaluatePromptGate: async () => ({ allowed: true }), sessionStore: { createSession, updateSession: vi.fn() },
+      trustedCallerForInboundTurn: async () => undefined, buildFollowUpCliInput,
+      beginReplyTargetTurn: vi.fn(), sendWorkerInput: send, forkWorker: fork, sessionPromptInjection: () => 'none',
+      markIngressAdmitted: vi.fn(), beginNewTurn: vi.fn(), rememberLastCliInput: vi.fn(), markSessionActivity: vi.fn(),
+    });
+    const result = await f.route(f.input);
+    expect(result.text).toContain('original-session'); expect(createSession).not.toHaveBeenCalled(); expect(fork).not.toHaveBeenCalled();
+    expect(send).toHaveBeenCalledTimes(1); expect(send.mock.calls[0][0]).toBe(executor);
+    expect(bind).toHaveBeenCalledWith('continue-attempt', 'original-session');
+    expect(finish).toHaveBeenCalledWith('continue-attempt', 'original-session', true);
+    if (cliId === 'codex-app') expect(send.mock.calls[0][1].codexAppInput.text).toBe('full supplemental code');
+  });
+  it.each(['interrupted', 'closed', 'attention', 'owner', 'directory', 'removed', 'rejected'])('does not inject or replace a session after a mid-dispatch %s intervention', async intervention => {
+    const f = setup(); const executor: any = { ...f.ds, session: { ...f.ds.session, sessionId: 'original-session', routerTask: { taskId: 'task', attemptId: 'old' } } };
+    f.scope.activeSessions.set('executor', executor);
+    const rejectContinuation = vi.fn(async () => {}); const finish = vi.fn(async () => {});
+    const bind = vi.fn(async () => {
+      if (intervention === 'interrupted') executor.session.lastTurn = { outcome: 'interrupted' };
+      if (intervention === 'closed') executor.session.status = 'closed';
+      if (intervention === 'attention') executor.agentAttention = { kind: 'decision' };
+      if (intervention === 'owner') executor.session.ownerOpenId = 'other';
+      if (intervention === 'directory') executor.workingDir = '/different';
+      if (intervention === 'removed') f.scope.activeSessions.delete('executor');
+    });
+    Object.assign(f.scope.defaultRouters.get('app:owner').router, { bind, finish, rejectContinuation });
+    f.handle.mockResolvedValueOnce({ kind: 'dispatch', instruction: 'supplement', project: f.ds.workingDir,
+      attemptId: 'next', taskId: 'task', title: 'format', sessionId: 'original-session' } as any);
+    const send = vi.fn(() => false); const createSession = vi.fn(); const fork = vi.fn();
+    executor.currentReplyTarget = { turnId: 'original' }; executor.session.currentReplyTarget = executor.currentReplyTarget;
+    Object.assign(f.scope, {
+      evaluatePromptGate: async () => ({ allowed: true }), sessionStore: { createSession, updateSession: vi.fn() },
+      trustedCallerForInboundTurn: async () => undefined, buildFollowUpCliInput, sessionPromptInjection: () => 'none',
+      beginReplyTargetTurn: vi.fn(() => { executor.currentReplyTarget = { turnId: 'new' }; executor.session.currentReplyTarget = executor.currentReplyTarget; }),
+      sendWorkerInput: send, forkWorker: fork,
+    });
+    await f.route(f.input);
+    expect(createSession).not.toHaveBeenCalled(); expect(fork).not.toHaveBeenCalled(); expect(finish).not.toHaveBeenCalled();
+    expect(rejectContinuation).toHaveBeenCalledWith('next');
+    expect(send).toHaveBeenCalledTimes(intervention === 'rejected' ? 1 : 0);
+    expect(executor.currentReplyTarget.turnId).toBe('original'); expect(executor.session.currentReplyTarget.turnId).toBe('original');
   });
   it('delivers approved instruction in Codex clean input, not the approval keyword', () => {
     const instruction = 'Implement the confirmed task with tests';

@@ -7,7 +7,7 @@ import { activeSessionKey, sessionAnchorId, type DaemonSession } from '../src/co
 import { listRouterProgress, interruptRouterProgress, routerProgressCard } from '../src/services/router-progress.js';
 function setup() {
   const root = mkdtempSync(join(tmpdir(), 'router-multi-')); const project = join(root, 'project'); mkdirSync(project);
-  const decide = vi.fn(async (): Promise<RouterDecision> => ({ action: 'propose', title: '北京天气', message: '方案就绪', project, instruction: '查询北京天气', isolated: true }));
+  const decide = vi.fn(async (): Promise<RouterDecision> => ({ action: 'propose', requiresApproval: true, title: '北京天气', message: '方案就绪', project, instruction: '查询北京天气', isolated: true }));
   const router = new DefaultRouter(root, { decide });
   const input: RouterInput = { conversation: 'window', owner: 'app:owner', messageId: 'beijing', text: '北京天气', projects: [project], executions: [] };
   const tasks = () => JSON.parse(readFileSync(join(root, 'ledger.json'), 'utf8')).tasks;
@@ -19,7 +19,7 @@ describe('duplex multi-task router', () => {
     const first = await f.router.handle({ ...f.input, messageId: 'approve-a', text: `批准执行 ${a.id} v${a.proposalRevision}` });
     if (first.kind !== 'dispatch') throw new Error('dispatch missing');
     await f.router.finish(first.attemptId, 's-a', true);
-    f.decide.mockResolvedValueOnce({ action: 'propose', message: '南京方案', title: '南京天气', project: f.project, instruction: '查询南京天气', isolated: true });
+    f.decide.mockResolvedValueOnce({ action: 'propose', requiresApproval: true, message: '南京方案', newTask: true, title: '南京天气', project: f.project, instruction: '查询南京天气', isolated: true });
     const executions = [{ sessionId: 's-a', busy: true, waiting: false, closed: false, interrupted: false, delivered: false }];
     await f.router.handle({ ...f.input, messageId: 'nanjing', text: '保留北京，另查南京', executions });
     const b = f.tasks().find((t: any) => t.title === '南京天气'); expect(b.id).not.toBe(a.id);
@@ -29,7 +29,7 @@ describe('duplex multi-task router', () => {
     expect(f.tasks()[0].state).toBe('running');
   });
   it('splits one prompt into multiple proposals and asks for an explicit approval target', async () => {
-    const f = setup(); f.decide.mockResolvedValueOnce({ action: 'propose', message: '双方案', title: '天气', project: f.project, instruction: '查天气',
+    const f = setup(); f.decide.mockResolvedValueOnce({ action: 'propose', requiresApproval: true, message: '双方案', title: '天气', project: f.project, instruction: '查天气',
       proposals: ['北京', '南京'].map(city => ({ title: city, project: f.project, instruction: `查${city}`, isolated: true })) });
     await f.router.handle(f.input); expect(f.tasks()).toHaveLength(2);
     const reply = await f.router.handle({ ...f.input, messageId: 'approve', text: '批准执行' });
@@ -38,7 +38,7 @@ describe('duplex multi-task router', () => {
   });
   it('preserves an unrelated proposal and its approval version when creating a new one', async () => {
     const f = setup(); await f.router.handle(f.input); const a = f.tasks()[0];
-    f.decide.mockResolvedValueOnce({ action: 'propose', message: '另建南京', title: '南京', project: f.project, instruction: '南京天气', isolated: true, newTask: true });
+    f.decide.mockResolvedValueOnce({ action: 'propose', requiresApproval: true, message: '另建南京', title: '南京', project: f.project, instruction: '南京天气', isolated: true, newTask: true });
     await f.router.handle({ ...f.input, messageId: 'b', text: '另查南京' });
     const stored = f.tasks().find((t: any) => t.id === a.id); expect(stored.state).toBe('proposed'); expect(stored.proposalRevision).toBe(a.proposalRevision);
     expect((await f.router.handle({ ...f.input, messageId: 'approve', text: `批准执行 ${a.id} v${a.proposalRevision}` })).kind).toBe('dispatch');
@@ -52,7 +52,7 @@ describe('duplex multi-task router', () => {
     expect(denied.kind).toBe('reply'); expect(f.tasks()[0].state).toBe('proposed');
   });
   it('does not store a rejected proposal as an accepted fact', async () => {
-    const f = setup(); f.decide.mockResolvedValueOnce({ action: 'propose', message: '已开始南京', title: '南京', project: '/unapproved', instruction: 'go' });
+    const f = setup(); f.decide.mockResolvedValueOnce({ action: 'propose', requiresApproval: true, message: '已开始南京', title: '南京', project: '/unapproved', instruction: 'go' });
     await f.router.handle(f.input); expect(f.tasks()[0].history.some((h: any) => h.text === '已开始南京')).toBe(false);
   });
   it('rejects stale proposal approval after a revision', async () => {
@@ -62,11 +62,11 @@ describe('duplex multi-task router', () => {
     expect(reply.kind).toBe('reply'); expect((reply as any).text).toContain('版本已变化');
   });
   it('does not let an idle review task block a new checkout task', async () => {
-    const f = setup(); f.decide.mockResolvedValueOnce({ action: 'propose', message: '方案', title: 'A', project: f.project, instruction: 'write' });
+    const f = setup(); f.decide.mockResolvedValueOnce({ action: 'propose', requiresApproval: true, message: '方案', title: 'A', project: f.project, instruction: 'write' });
     await f.router.handle(f.input); const first = await f.router.handle({ ...f.input, messageId: 'a', text: '批准执行' });
     if (first.kind !== 'dispatch') throw new Error('missing'); await f.router.finish(first.attemptId, 's-a', true);
     const executions = [{ sessionId: 's-a', busy: false, waiting: false, closed: false, interrupted: false, delivered: true, turnId: 'a' }];
-    f.decide.mockResolvedValueOnce({ action: 'propose', message: 'B', title: 'B', project: f.project, instruction: 'write B' });
+    f.decide.mockResolvedValueOnce({ action: 'propose', requiresApproval: true, message: 'B', newTask: true, title: 'B', project: f.project, instruction: 'write B' });
     await f.router.handle({ ...f.input, messageId: 'b', text: '另做B', executions });
     expect((await f.router.handle({ ...f.input, messageId: 'approve-b', text: '批准执行', executions })).kind).toBe('dispatch');
     expect(f.tasks()[0].state).toBe('review');
@@ -94,8 +94,8 @@ describe('duplex multi-task router', () => {
     await vi.waitFor(() => expect(release).toBeTypeOf('function'));
     await f.router.reconcile([{ sessionId: 'session-a', busy: false, waiting: false, closed: false, interrupted: false, delivered: true, turnId: 'approve' }]);
     expect(f.tasks()[0].state).toBe('review');
-    release({ action: 'propose', title: '南京', message: '方案', project: f.project, instruction: '南京天气', isolated: true }); await pending;
-    expect(f.tasks()[0].state).toBe('review'); expect(f.tasks()[1].state).toBe('proposed');
+    release({ action: 'propose', requiresApproval: true, title: '南京', message: '方案', project: f.project, instruction: '南京天气', isolated: true }); await pending;
+    expect(f.tasks()[0].state).toBe('review'); expect(f.tasks()).toHaveLength(1);
   });
   it('does not allow a failed progress transport to block proposal creation', async () => {
     const f = setup(); await f.router.handle({ ...f.input, onProgress: () => { throw new Error('network'); } }); expect(f.tasks()[0].state).toBe('proposed');

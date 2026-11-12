@@ -10,7 +10,7 @@ import { normalizeAgentRouter } from '../src/bot-registry.js';
 function setup() {
   const root = mkdtempSync(join(tmpdir(), 'default-router-test-'));
   const project = join(root, 'project'); mkdirSync(project);
-  const decide = vi.fn(async (): Promise<RouterDecision> => ({ action: 'propose', message: 'ready', title: 'task', project, instruction: 'implement with tests' }));
+  const decide = vi.fn(async (): Promise<RouterDecision> => ({ action: 'propose', message: 'ready', title: 'task', project, instruction: 'implement with tests', requiresApproval: true }));
   const router = new DefaultRouter(join(root, 'ledger'), { decide });
   const input: RouterInput = { conversation: 'c', owner: 'owner', messageId: 'm1', text: 'build it', projects: [project] };
   return { root, project, decide, router, input };
@@ -118,7 +118,7 @@ describe('default hidden router', () => {
     const first = router.handle(input);
     await vi.waitFor(() => expect(release).toBeTypeOf('function'));
     const cancel = router.handle({ ...input, messageId: 'cancel', text: '取消任务' });
-    release({ action: 'propose', message: 'ready', title: 't', project: input.projects[0], instruction: 'work' });
+    release({ action: 'propose', message: 'ready', title: 't', project: input.projects[0], instruction: 'work', requiresApproval: true });
     await Promise.all([first, cancel]);
     expect(JSON.parse(readFileSync(join(root, 'ledger', 'ledger.json'), 'utf8')).tasks[0].state).toBe('cancelled');
   });

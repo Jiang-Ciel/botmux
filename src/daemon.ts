@@ -26512,16 +26512,82 @@ async function routeOrdinaryHuman(input: {
     owner: `${ctx.larkAppId}:${owner}`, messageId: ctx.messageId, text: input.text, controlText: input.command, projects,
     onProgress: value => { latest = value; paintProgress(!!value.finishedAt); },
     executions: [...activeSessions.values()].filter(other => other.larkAppId === ctx.larkAppId).map(routerExecutionFacts),
-    projectBusy: project => [...activeSessions.values()].some(other =>
-      canonicalRouterProjects([other.workingDir ?? ''])[0] === project
+    projectBusy: (project, excludeSessionId) => [...activeSessions.values()].some(other =>
+      other.session.sessionId !== excludeSessionId && canonicalRouterProjects([other.workingDir ?? ''])[0] === project
       && (routerExecutionFacts(other).busy || routerExecutionFacts(other).waiting)),
   }); } finally { clearInterval(timer); }
   if (result.kind !== 'dispatch') return result;
+  const replies: string[] = [];
+  for (const task of [result, ...(result.additional ?? [])]) {
+    replies.push(await dispatchOrdinaryRouterTask(task, entry.router, ctx, data));
+  }
+  return { kind: 'reply', text: replies.join('\n\n') };
+
+}
+async function dispatchOrdinaryRouterTask(
+  result: import('./services/default-router.js').RouterDispatch,
+  router: DefaultRouter, ctx: RoutingContext, data: any,
+): Promise<string> {
+  const cfg = getBot(ctx.larkAppId).config;
+  const owner = data.sender.sender_id.open_id as string;
   // Dispatch by task identity, never by the collection window's anchor slot.
   const gate = await evaluatePromptGate('prompt.submit', { larkAppId: ctx.larkAppId, chatId: ctx.chatId,
     chatType: ctx.chatType, anchor: ctx.anchor, messageId: ctx.messageId, senderOpenId: owner,
     promptContent: result.instruction, promptAttachments: [] });
-  if (!gate.allowed) return { kind: 'reply', text: '已批准需求被内容策略拒绝，派发未执行；保留记录供核查。' };
+  const rejectUnsent = async (text: string) => {
+    if (result.sessionId) await router.rejectContinuation(result.attemptId);
+    return text;
+  };
+  if (!gate.allowed) return rejectUnsent('需求被内容策略拒绝，未派发；记录保留供核查。');
+  if (result.sessionId) {
+    const executor = [...activeSessions.values()].find(other => other.session.sessionId === result.sessionId
+      && other.larkAppId === ctx.larkAppId && other.session.ownerOpenId === owner
+      && other.session.routerTask?.taskId === result.taskId);
+    if (!executor || routerExecutionFacts(executor).busy || routerExecutionFacts(executor).interrupted || executor.session.status === 'closed'
+      || !executor.worker || executor.worker.killed || executor.pendingRepo || executor.tuiPromptCardId || executor.agentAttention)
+      return rejectUnsent('原执行会话不可用、仍忙或等待受管交互；补充已保留，不会新起会话。');
+    const worker = executor.worker;
+    const generation = executor.session.workerGeneration;
+    const nativeThread = executor.session.cliSessionId;
+    const workingDir = executor.workingDir;
+    const caller = await trustedCallerForInboundTurn(ctx.larkAppId, owner, executor.session.ownerUnionId, false, ctx.messageId);
+    await router.bind(result.attemptId, executor.session.sessionId);
+    if (![...activeSessions.values()].includes(executor) || executor.larkAppId !== ctx.larkAppId
+      || executor.session.ownerOpenId !== owner || executor.session.routerTask?.taskId !== result.taskId
+      || executor.workingDir !== workingDir || executor.worker !== worker || worker.killed || executor.session.workerGeneration !== generation
+      || executor.session.cliSessionId !== nativeThread || routerExecutionFacts(executor).closed || routerExecutionFacts(executor).interrupted
+      || executor.pendingRepo || executor.tuiPromptCardId || executor.agentAttention || routerExecutionFacts(executor).busy)
+      return rejectUnsent('原执行会话已变化；本次未注入，不会新起会话。');
+    const payload = buildFollowUpCliInput(result.instruction, executor.session.sessionId, {
+      cliId: cfg.cliId, sender: { openId: owner, type: 'user' },
+      codexAppText: result.instruction, larkAppId: ctx.larkAppId, chatId: ctx.chatId,
+      selfMention: { name: getBot(ctx.larkAppId).botName, openId: getBot(ctx.larkAppId).botOpenId },
+      sessionBackendType: executor.session.backendType, promptInjection: sessionPromptInjection(executor), turnId: ctx.messageId,
+    });
+    const bindingKeys = ['quoteTargetId', 'quoteTargetSenderOpenId', 'quoteTargetSenderIsBot',
+      'turnReplyContexts', 'replyTargets', 'replyTargetsPrunedThrough', 'replyThreadAliases', 'currentReplyTarget'];
+    const bindings = [
+      ...bindingKeys.map(key => ({ target: executor.session, key, descriptor: Object.getOwnPropertyDescriptor(executor.session, key) })),
+      ...['replyThreadAliases', 'currentReplyTarget'].map(key => ({ target: executor, key, descriptor: Object.getOwnPropertyDescriptor(executor, key) })),
+    ];
+    beginReplyTargetTurn(executor, ctx.scope === 'thread' ? ctx.anchor : undefined, ctx.messageId,
+      new Date().toISOString(), { senderOpenId: owner, sourceMessageId: result.sourceMessageId,
+        participants: [{ openId: owner, isBot: false }], participantsIncomplete: false, inThread: ctx.scope === 'thread' });
+    if (!sendWorkerInput(executor, payload, ctx.messageId, { trustedCaller: caller, atMostOnce: true })) {
+      for (const { target, key, descriptor } of bindings) {
+        if (descriptor) Object.defineProperty(target, key, descriptor); else Reflect.deleteProperty(target, key);
+      }
+      sessionStore.updateSession(executor.session);
+      return rejectUnsent('原执行会话未接纳补充；已恢复原任务状态，不会另起任务。');
+    }
+    markIngressAdmitted(ctx);
+    beginNewTurn(executor, result.instruction, ctx.messageId);
+    rememberLastCliInput(executor, result.instruction, payload, ctx.messageId);
+    executor.session.routerTask!.attemptId = result.attemptId;
+    markSessionActivity(executor, Date.now(), { human: true }); sessionStore.updateSession(executor.session);
+    await router.finish(result.attemptId, executor.session.sessionId, true);
+    return `${result.summary ?? `- 延续任务：${result.title}`}\n- 原后台 session：${executor.session.sessionId}`;
+  }
   const session = sessionStore.createSession(ctx.chatId, ctx.scope === 'thread' ? ctx.anchor : ctx.messageId,
     result.title ?? 'Router task', ctx.chatType, undefined, { source: 'ordinary-feishu' });
   session.larkAppId = ctx.larkAppId; session.scope = ctx.scope;
@@ -26541,7 +26607,7 @@ async function routeOrdinaryHuman(input: {
       participants: [{ openId: owner, isBot: false }], participantsIncomplete: false, inThread: ctx.scope === 'thread' });
   sessionStore.updateSession(session);
   const registration = await claimNewDaemonSession(activeSessions, executor);
-  if (!registration.accepted) return { kind: 'reply', text: '执行会话注册未成功，派发记录已保留，不会自动重发。' };
+  if (!registration.accepted) return '执行会话注册失败，记录已保留，不会自动重发。';
   const caller = await trustedCallerForInboundTurn(ctx.larkAppId, owner, session.ownerUnionId, false, ctx.messageId);
   const sender = { openId: owner, type: 'user' as const };
   const payload = buildNewTopicCliInput(
@@ -26550,7 +26616,6 @@ async function routeOrdinaryHuman(input: {
     await getAvailableBots(ctx.larkAppId, ctx.chatId), undefined,
     { name: getBot(ctx.larkAppId).botName, openId: getBot(ctx.larkAppId).botOpenId }, localeForBot(ctx.larkAppId), sender,
     { larkAppId: ctx.larkAppId, chatId: ctx.chatId, trustedCaller: caller });
-  const router = entry.router;
   await router.bind(result.attemptId, session.sessionId);
   forkWorker(executor, payload, { turnId: ctx.messageId, trustedCaller: caller }, {
     onAdmission: admission => {
@@ -26560,9 +26625,9 @@ async function routeOrdinaryHuman(input: {
       }
     },
   });
-  return { kind: 'reply', text: `任务已进入派发：${result.title}\n任务 ID：${result.taskId}\n后台 session：${session.sessionId}\n结果将回到本窗口，可继续提出其他需求。` };
-
+  return `${result.summary ?? `- 任务：${result.title}`}\n- 后台 session：${session.sessionId}\n- 结果将回到本窗口。`;
 }
+
 async function finishOrdinaryRouter(ctx: RoutingContext, data: any, result: import('./services/default-router.js').RouterResult | undefined): Promise<void> {
   if (result?.kind !== 'dispatch') return;
   const entry = defaultRouters.get(`${ctx.larkAppId}:${data?.sender?.sender_id?.open_id}`);
