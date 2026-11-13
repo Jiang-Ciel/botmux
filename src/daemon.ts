@@ -48,7 +48,7 @@ import { installDaemonRejectionGuard } from './utils/daemon-rejection-guard.js';
 import { getLarkConnectionHealth, type LarkConnectionHealth } from './im/lark/transport/connection-health.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { DefaultRouter, canonicalRouterProjects, routerConversation, routerExecutionFacts } from './services/default-router.js';
-import { interruptRouterProgress, routerProgressCard, type RouterProgress } from './services/router-progress.js';
+import { interruptRouterProgress } from './services/router-progress.js';
 import { RouterBoardManager } from './services/router-board.js';
 import { routerTaskGraph } from './services/router-task-graph.js';
 import { publicReplyCardTools } from './im/lark/turn-reply-card.js';
@@ -26452,6 +26452,17 @@ const routerBoards = new RouterBoardManager(join(config.session.dataDir, 'agent-
   patch: (b, card) => updateMessage(b.app, b.messageId!, JSON.stringify(card)),
   graph: async (tasks, app) => uploadImage(app, await routerTaskGraph(tasks)),
   projects: b => routerBoardReader.listProjects(`${b.app}:${b.owner}`),
+  terminal: task => {
+    const ds = [...activeSessions.values()].find(ds => ds.larkAppId === task.routingOrigin?.larkAppId && ds.session.sessionId === task.attempt?.sessionId);
+    if (!task.attempt) return '尚未派发';
+    if (!ds) return '绑定 session 当前不可用';
+    const f = routerExecutionFacts(ds);
+    const sameAttempt = ds.session.routerTask?.taskId === task.id && ds.session.routerTask?.attemptId === task.attempt.id;
+    if (!sameAttempt) return `本任务轮次：${task.state === 'completed' ? '已完成' : '非当前 session 轮次'}\nsession：${ds.session.sessionId}（可能已复用，不展示其它任务状态）`;
+    const currentTurn = f.turnId === task.attempt.turnId;
+    if (!currentTurn) return `${ds.session.cliId ?? 'CLI'} · 当前任务轮次尚无有效终端状态，等待同步\nsession：${ds.session.sessionId}`;
+    return `${ds.session.cliId ?? 'CLI'} · ${f.closed ? '已关闭' : f.interrupted ? '已中断' : f.waiting ? '等待输入' : f.busy ? '执行中' : currentTurn && f.delivered ? '本轮已投递结束' : '空闲，等待结算'}\nsession：${ds.session.sessionId}\n最近活动：${new Date(ds.lastMessageAt).toISOString()}`;
+  },
   tools: task => {
     const ds = [...activeSessions.values()].find(ds => ds.session.sessionId === task.attempt?.sessionId);
     return ds && ds.lastThinkingUpdate && ds.lastThinkingUpdate.turnId === task.attempt?.turnId
@@ -26464,8 +26475,8 @@ const routerBoards = new RouterBoardManager(join(config.session.dataDir, 'agent-
       scope: b.scope, anchor: b.anchor, messageId: b.sourceMessageId },
       data: { sender: { sender_type: 'user', sender_id: { open_id: b.owner } } },
       command, text: ['supplement', 'create_project'].includes(op) || op.startsWith('merge_project:') ? note || task.title : command, resources: [], card: { messageId, taskId: task.id, revision: task.revision, note, confirmPrompt: op === 'send_prompt', projectAction: op === 'direct_task' ? 'direct' : op === 'create_project' ? 'create' : op.startsWith('merge_project:') ? 'merge' : undefined, mergeProjectId: op.startsWith('merge_project:') ? op.slice('merge_project:'.length) : undefined } });
-    if (result?.kind === 'reply' && result.card) await replyMessage(b.app, b.sourceMessageId, JSON.stringify(result.card), 'interactive', b.scope === 'thread', randomUUID());
-    return result?.kind === 'reply' ? result.card ? '任务已受理，执行状态见摘要卡片。' : result.text : '当前入口不可操作；任务未获新增派发，请核查受管执行会话。';
+    if (result?.kind === 'reply' && !result.presented && result.card) await replyMessage(b.app, b.sourceMessageId, JSON.stringify(result.card), 'interactive', b.scope === 'thread', randomUUID());
+    return result?.kind === 'reply' ? result.notice ?? (result.card ? '' : result.text) : '当前入口不可操作；任务未获新增派发，请核查受管执行会话。';
   },
   error: () => logger.warn('[router] task board transport failed; ledger unchanged'),
 });
@@ -26541,9 +26552,8 @@ async function drainRouterPools() {
       const task = (await entry.router.listTasks(key)).find(t => t.id === result.taskId);
       const origin = task?.routingOrigin;
       const ctx = origin ? { ...route.ctx, ...origin, messageId: result.sourceMessageId ?? route.ctx.messageId } : route.ctx;
-      let status = '等待执行接纳回执。';
-      await dispatchOrdinaryRouterTask(result, entry.router, ctx, route.data, value => { status = value; });
-      await sessionReply(ctx.anchor, JSON.stringify(routerTaskSummaryCard(result.title ?? '任务', task?.coreWork ?? result.title ?? '执行用户请求', status)), 'interactive', ctx.larkAppId);
+      await dispatchOrdinaryRouterTask(result, entry.router, ctx, route.data);
+      await routerBoards.present({ app: ctx.larkAppId, owner: key.slice(ctx.larkAppId.length + 1), chatId: ctx.chatId, chatType: ctx.chatType, scope: ctx.scope, anchor: ctx.anchor, sourceMessageId: ctx.messageId, conversation: routerConversation(ctx.larkAppId, ctx.chatId, ctx.scope, ctx.anchor, key.slice(ctx.larkAppId.length + 1)) }, result.taskId);
     }
     await ensureRouterPool(entry.router, route.ctx, route.data, getBot(route.ctx.larkAppId).config.agentRouter && getBot(route.ctx.larkAppId).config.agentRouter !== false ? (getBot(route.ctx.larkAppId).config.agentRouter as { poolSize?: number }).poolSize ?? 4 : 4);
   }
@@ -26607,38 +26617,29 @@ async function routeOrdinaryHuman(input: {
   const projects = canonicalRouterProjects([input.project ?? pinned ?? cfg.workingDir ?? '', ...(cfg.workingDirs ?? [])]);
   await ensureRouterPool(entry.router, ctx, data, options.poolSize ?? 4);
   routerPoolRoutes.set(key, { ctx, data, projects });
-  let latest: RouterProgress | undefined;
-  let cardId: string | undefined;
-  let cardWork = Promise.resolve();
-  let lastPaint = 0;
-  const paintProgress = (force = false) => {
-    if (!latest || (!force && Date.now() - lastPaint < 3000)) return;
-    lastPaint = Date.now(); const value = structuredClone(latest);
-    cardWork = cardWork.then(async () => {
-      if (cardId) await updateMessage(ctx.larkAppId, cardId, JSON.stringify(routerProgressCard(value)));
-      else cardId = await replyMessage(ctx.larkAppId, ctx.messageId, JSON.stringify(routerProgressCard(value)), 'interactive', ctx.scope === 'thread');
-    }).catch(() => { logger.warn('[router] progress card delivery failed'); });
-  };
-  const timer = setInterval(() => { if (latest && !latest.finishedAt) paintProgress(); }, 5000); timer.unref?.();
   let result: import('./services/default-router.js').RouterResult;
-  try { result = await entry.router.handle({
+  result = await entry.router.handle({
     conversation: routerConversation(ctx.larkAppId, ctx.chatId, ctx.scope, ctx.anchor, owner),
     owner: `${ctx.larkAppId}:${owner}`, messageId: input.card?.messageId ?? ctx.messageId, text: input.text, controlText: input.command, projects,
     targetTaskId: input.card?.taskId, expectedRevision: input.card?.revision, reviewNote: input.card?.note,
     routingOrigin: { larkAppId: ctx.larkAppId, chatId: ctx.chatId, chatType: ctx.chatType, scope: ctx.scope, anchor: ctx.anchor },
     confirmPrompt: input.card?.confirmPrompt, projectAction: input.card?.projectAction, mergeProjectId: input.card?.mergeProjectId, projectName: input.card?.note,
-    onProgress: value => { latest = value; paintProgress(!!value.finishedAt); },
+
     executions: [...activeSessions.values()].filter(other => other.larkAppId === ctx.larkAppId).map(routerExecutionFacts),
     projectBusy: (project, excludeSessionId) => [...activeSessions.values()].some(other =>
       other.session.sessionId !== excludeSessionId && canonicalRouterProjects([other.workingDir ?? ''])[0] === project
       && (routerExecutionFacts(other).busy || routerExecutionFacts(other).waiting)),
-  }); } finally { clearInterval(timer); }
-  if (!input.card) await routerBoards.ensure({ app: ctx.larkAppId, owner, chatId: ctx.chatId, chatType: ctx.chatType,
-    scope: ctx.scope, anchor: ctx.anchor, sourceMessageId: ctx.messageId,
-    conversation: routerConversation(ctx.larkAppId, ctx.chatId, ctx.scope, ctx.anchor, owner) }).catch(() => logger.warn('[router] task board creation failed'));
+  });
+  const binding = { app: ctx.larkAppId, owner, chatId: ctx.chatId, chatType: ctx.chatType, scope: ctx.scope,
+    anchor: ctx.anchor, sourceMessageId: ctx.messageId,
+    conversation: routerConversation(ctx.larkAppId, ctx.chatId, ctx.scope, ctx.anchor, owner) };
   if (result.kind !== 'dispatch') {
-    if (!input.card || input.card.note) await routerBoards.offerProject({ app: ctx.larkAppId, owner, chatId: ctx.chatId, chatType: ctx.chatType, scope: ctx.scope, anchor: ctx.anchor, sourceMessageId: ctx.messageId, conversation: routerConversation(ctx.larkAppId, ctx.chatId, ctx.scope, ctx.anchor, owner) });
-    return result;
+    if (result.responseOnly) return result;
+    // Card callbacks update their originating card after returning from this method.
+    const tasks = await entry.router.listTasks(key);
+    const affected = [...tasks].reverse().find(t => t.state !== 'cancelled' && t.seen.includes(input.card?.messageId ?? ctx.messageId));
+    const presented = !input.card && affected && await routerBoards.present(binding, affected.id);
+    return { ...result, card: undefined, text: !input.card && affected && !presented ? '任务已记录，但状态卡投递未确认；不会自动重发或重复执行，请查看后台状态。' : result.text, presented: !!presented || !!input.card };
   }
   const replies: string[] = [];
   const statuses: string[] = [];
@@ -26646,7 +26647,8 @@ async function routeOrdinaryHuman(input: {
     replies.push(await dispatchOrdinaryRouterTask(task, entry.router, { ...ctx, messageId: input.card?.messageId ?? ctx.messageId }, data, value => { statuses.push(value); }));
   }
   const current = (await entry.router.listTasks(key)).find(t => t.id === result.taskId);
-  return { kind: 'reply', text: replies.join('\n\n'), card: routerTaskSummaryCard(result.title ?? '任务', current?.coreWork ?? result.title ?? '执行用户请求', statuses.join('\n') || '等待执行接纳回执。') };
+  const presented = input.card ? true : await routerBoards.present(binding, result.taskId);
+  return { kind: 'reply', presented, notice: statuses.join('\n'), text: presented ? replies.join('\n\n') : '执行请求已受理，但状态卡投递未确认；不会自动重发或重复执行，请查看后台状态。', card: presented ? routerTaskSummaryCard(result.title ?? '任务', current?.coreWork ?? result.title ?? '执行用户请求', statuses.join('\n') || '等待执行接纳回执。') : undefined };
 
 }
 async function dispatchOrdinaryRouterTask(
@@ -26699,7 +26701,7 @@ async function dispatchOrdinaryRouterTask(
         routerOrigin: { scope: ctx.scope, chatId: ctx.chatId, threadRootId: ctx.anchor },
         participants: [{ openId: owner, isBot: false }], participantsIncomplete: false, inThread: ctx.scope === 'thread' });
     const previousTask = structuredClone(executor.session.routerTask);
-    const nextTask = { taskId: result.taskId!, attemptId: result.attemptId, sourceMessageId: result.sourceMessageId ?? ctx.messageId, title: result.title ?? 'Task' };
+    const nextTask = { taskId: result.taskId!, attemptId: result.attemptId, sourceMessageId: result.sourceMessageId ?? ctx.messageId, title: result.title ?? 'Task', unifiedCard: true };
     sessionStore.updateRouterTask(executor.session, previousTask, nextTask);
     sessionStore.updateSession(executor.session);
     const restoreUnsent = async () => {
@@ -26737,7 +26739,7 @@ async function dispatchOrdinaryRouterTask(
   session.creatorOpenId = owner; session.lastCallerOpenId = owner; session.workingDir = result.project;
   session.quoteTargetId = result.sourceMessageId ?? ctx.messageId; session.quoteTargetSenderOpenId = owner;
   sessionStore.updateRouterTask(session, undefined, { taskId: result.taskId!, attemptId: result.attemptId,
-    sourceMessageId: result.sourceMessageId ?? ctx.messageId, title: result.title ?? 'Router task' });
+    sourceMessageId: result.sourceMessageId ?? ctx.messageId, title: result.title ?? 'Router task', unifiedCard: true });
   session.nativeSessionTitle = result.title; session.nativeSessionTitleUserDefined = true;
   stampHumanActivity(session, Date.now()); sessionStore.updateSession(session);
   const executor: DaemonSession = { session, worker: null, workerPort: null, workerToken: null,
@@ -27214,7 +27216,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   }
   const routerResult = await routeOrdinaryHuman({ ctx, data, text: content, command: cmdContent, resources,
     project: topicSpec?.workingDir, skip: isBareForceTopic || !!forceTopic || !!workflowGrillPrompt || isForeignBotSender });
-  if (routerResult?.kind === 'reply') { await sessionReply(anchor, routerResult.card ? JSON.stringify(routerResult.card) : routerResult.text, routerResult.card ? 'interactive' : 'text', larkAppId); return; }
+  if (routerResult?.kind === 'reply') { if (!routerResult.presented) await sessionReply(anchor, routerResult.card ? JSON.stringify(routerResult.card) : routerResult.text, routerResult.card ? 'interactive' : 'text', larkAppId); return; }
   if (routerResult?.kind === 'dispatch') {
     const gate = await evaluatePromptGate('prompt.submit', { larkAppId, chatId, chatType, anchor, messageId,
       senderOpenId, promptContent: routerResult.instruction, promptAttachments: [] });
@@ -29964,7 +29966,7 @@ async function handleThreadReplyAdmitted(
   if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
   const routerResult = await routeOrdinaryHuman({ ctx, data, text: content, command: cmdContent, resources,
     skip: answeringAgentAttention || !!prepared || !!replay || !!workflowHandoff || isForeignBot });
-  if (routerResult?.kind === 'reply') { await sessionReply(anchor, routerResult.card ? JSON.stringify(routerResult.card) : routerResult.text, routerResult.card ? 'interactive' : 'text', larkAppId); return; }
+  if (routerResult?.kind === 'reply') { if (!routerResult.presented) await sessionReply(anchor, routerResult.card ? JSON.stringify(routerResult.card) : routerResult.text, routerResult.card ? 'interactive' : 'text', larkAppId); return; }
   if (routerResult?.kind === 'dispatch') {
     if (dsPre && canonicalRouterProjects([dsPre.workingDir ?? ''])[0] !== routerResult.project) {
       await sessionReply(anchor, '目标项目与当前执行会话不一致，派发已停止并保留栅栏，请核查后另开话题。', 'text', larkAppId);

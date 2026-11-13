@@ -14,6 +14,7 @@ export interface RouterBoardDeps {
   reply(b: RouterBoardBinding, card: unknown, uuid: string): Promise<string>;
   patch(b: RouterBoardBinding, card: unknown): Promise<void>;
   graph?(tasks: RouterTask[], app: string): Promise<string>;
+  terminal?(task: RouterTask): string;
   tools?(task: RouterTask): Array<{ name: string; subject?: string; completed?: boolean }>;
   execute(b: RouterBoardBinding, task: RouterTask, op: string, note: string, eventId: string): Promise<string>;
   error(error: unknown): void;
@@ -63,14 +64,43 @@ export class RouterBoardManager {
       } else await this.paint(b);
     });
   }
-  private hash(tasks: RouterTask[]) { return createHash('sha256').update(JSON.stringify(tasks.map(t => [t.id, t.revision, t.state]))).digest('hex'); }
+  /** One live card per task; ownership and task revisions remain ledger-authoritative. */
+  async present(input: Omit<RouterBoardBinding, 'id' | 'hash' | 'messageId' | 'delivery'>, taskId?: string) {
+    if (!this.load() || (this.deps.namespace && this.deps.namespace() !== input.app)) return false;
+    const tasks = await this.deps.tasks({ ...input, id: '' });
+    const task = taskId ? tasks.find(t => t.id === taskId) : [...tasks].reverse().find(t => t.state !== 'cancelled');
+    if (!task) return false;
+    const existing = [...this.bindings.values()].find(b => b.unified && b.app === input.app && b.owner === input.owner && b.conversation === input.conversation && b.taskId === task.id);
+    const id = existing?.id ?? createHash('sha256').update(JSON.stringify([input.app, input.owner, input.conversation, task.id])).digest('hex');
+    await this.serial(id, async () => {
+      let b = this.bindings.get(id);
+      if (b?.delivery === 'pending') { b.delivery = 'uncertain'; this.save(); }
+      if (b?.delivery === 'uncertain') return; // Unknown sends must never be replayed by a tick.
+      if (!b) {
+        b = { ...input, id, taskId: task.id, unified: true, delivery: 'pending' }; this.bindings.set(id, b); this.save();
+        try { b.messageId = await this.deps.reply(b, await this.card(b, tasks), randomUUID()); b.delivery = 'active'; b.hash = this.hash(tasks, b); b.formActive = this.hasForm(task); this.save(); }
+        catch (e) { b.delivery = 'uncertain'; this.save(); this.deps.error(e); }
+      } else await this.paint(b);
+    });
+    return this.bindings.get(id)?.delivery === 'active';
+  }
+  private hasForm(t?: RouterTask) { return !!t && !!(t.projectOffer || t.promptReview || t.approvalRequired || ['collecting', 'proposed', 'review'].includes(t.state) || t.state === 'running' && t.conversationProjectId); }
+  private async card(b: RouterBoardBinding, tasks: RouterTask[], notice?: string) {
+    const task = tasks.find(t => t.id === b.taskId);
+    return routerTaskCard(b, tasks, { taskId: b.taskId, unified: b.unified, notice: notice ?? b.notice,
+      projects: await this.deps.projects?.(b), terminal: task && this.deps.terminal?.(task), tools: task && this.deps.tools?.(task) });
+  }
+  private hash(tasks: RouterTask[], b?: RouterBoardBinding) { return createHash('sha256').update(JSON.stringify(tasks.filter(t => !b?.taskId || t.id === b.taskId).map(t => [t.id, t.revision, t.state, b?.unified ? this.deps.terminal?.(t) : undefined, b?.unified ? this.deps.tools?.(t) : undefined]))).digest('hex'); }
   private async paint(b: RouterBoardBinding, force = false) {
     if (b.delivery !== 'active' || !b.messageId) return;
-    const tasks = await this.deps.tasks(b); const hash = this.hash(tasks);
+    const tasks = await this.deps.tasks(b); const hash = this.hash(tasks, b);
     if (!force && hash === b.hash) return;
-    const imageKey = await this.deps.graph?.(tasks, b.app).catch(this.deps.error);
-    await this.deps.patch(b, routerTaskCard(b, tasks, { imageKey: imageKey || undefined }));
-    b.hash = hash; this.save();
+    const task = tasks.find(t => t.id === b.taskId);
+    // Automatic patches must not reset an in-progress form. Explicit callbacks refresh it.
+    if (b.unified && !force && b.formActive && this.hasForm(task)) return;
+    if (b.unified) await this.deps.patch(b, await this.card(b, tasks));
+    else { const imageKey = await this.deps.graph?.(tasks, b.app).catch(this.deps.error); await this.deps.patch(b, routerTaskCard(b, tasks, { imageKey: imageKey || undefined })); }
+    b.hash = hash; b.formActive = this.hasForm(task); this.save();
   }
   async offerProject(input: Omit<RouterBoardBinding, 'id' | 'hash' | 'messageId' | 'delivery'>) {
     if (!this.load()) return;
@@ -99,6 +129,8 @@ export class RouterBoardManager {
       const tasks = await this.deps.tasks(b); const task = tasks.find(t => t.id === v.task);
       if (v.op === 'refresh') { await this.paint(b, true); return toast('已刷新任务总览'); }
       if (!task) return toast('任务已不存在或不属于当前窗口。');
+      if (b.unified && v.task !== b.taskId) return toast('卡片任务绑定已变化，请刷新。');
+      if (v.op === 'view' && b.unified) { await this.paint(b, true); return toast('已刷新任务卡'); }
       if (v.op === 'view') {
         await this.deps.reply(b, routerTaskCard(b, tasks, { taskId: task.id, tools: this.deps.tools?.(task), projects: await this.deps.projects?.(b) }), randomUUID());
         return toast('已发送独立节点详情卡，可在卡片中审核');
@@ -115,7 +147,24 @@ export class RouterBoardManager {
       if (!this.deps.allowed(b, operator, data.operator?.union_id)) return toast('操作权限已变化。');
       const notice = await this.deps.execute(b, task, v.op, note, id);
       const updated = await this.deps.tasks(b);
-      await this.deps.reply(b, routerTaskCard(b, updated, { taskId: task.id, notice, projects: await this.deps.projects?.(b), tools: this.deps.tools?.(updated.find(t => t.id === task.id) ?? task) }), randomUUID());
+      if (b.unified) {
+        const source = updated.find(t => t.id === task.id);
+        if (source?.mergedIntoTaskId) {
+          const destination = updated.find(t => t.id === source.mergedIntoTaskId);
+          if (destination) {
+            const other = [...this.bindings.values()].find(other => other.id !== b.id && other.unified && other.app === b.app && other.owner === b.owner && other.conversation === b.conversation && other.taskId === destination.id);
+            if (other) {
+              await this.deps.patch(b, routerTaskCard(b, updated, { taskId: task.id, notice: '已归并，请在该 Project 的原任务卡继续。' }));
+              this.bindings.delete(b.id); this.save();
+              await this.serial(other.id, () => this.paint(other, true));
+              return toast('已归并，请在 Project 原任务卡继续');
+            }
+            else b.taskId = destination.id;
+          }
+        }
+        b.notice = notice || undefined;
+        await this.deps.patch(b, await this.card(b, updated, notice)); b.hash = this.hash(updated, b); b.formActive = this.hasForm(updated.find(t => t.id === b.taskId)); this.save(); }
+      else await this.deps.reply(b, routerTaskCard(b, updated, { taskId: task.id, notice, projects: await this.deps.projects?.(b), tools: this.deps.tools?.(updated.find(t => t.id === task.id) ?? task) }), randomUUID());
       await this.paint(b);
       return toast('操作已处理，请查看最新节点卡。');
     });

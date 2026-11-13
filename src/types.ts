@@ -545,7 +545,7 @@ export interface WorkflowNodeSessionMarker {
 export interface Session {
   /** Router-owned task executor; visible reply route is independent of runtime ownership. */
   routerPool?: { slotId: string; owner: string };
-  routerTask?: { taskId: string; attemptId: string; sourceMessageId: string; title: string };
+  routerTask?: { taskId: string; attemptId: string; sourceMessageId: string; title: string; unifiedCard?: boolean };
   sessionLifecycle?: import('./services/session-contract.js').SessionLifecycle;
   sessionContractRevision?: number;
   sessionRuntimeContract?: import('./services/session-contract-store.js').SessionContractSnapshot;

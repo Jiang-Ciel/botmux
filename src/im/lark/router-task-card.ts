@@ -2,7 +2,7 @@ import type { RouterTask } from '../../services/default-router.js';
 export interface RouterBoardBinding {
   id: string; app: string; owner: string; conversation: string; chatId: string;
   chatType: 'p2p' | 'group'; scope: 'chat' | 'thread'; anchor: string; sourceMessageId: string;
-  messageId?: string; delivery?: 'pending' | 'active' | 'uncertain'; hash?: string;
+  taskId?: string; unified?: boolean; formActive?: boolean; notice?: string; messageId?: string; delivery?: 'pending' | 'active' | 'uncertain'; hash?: string;
 }
 export const taskStates: Record<RouterTask['state'], string> = {
   collecting: '收集需求', proposed: '待批准方案', dispatching: '派发待核实', running: '执行中',
@@ -21,7 +21,7 @@ export function routerTaskSummaryCard(title: string, coreWork: string, status?: 
     header: { template: 'blue', title: plain(title) },
     body: { elements: [md(safe(coreWork)), ...(status ? [md(safe(status))] : [])] } };
 }
-export function routerTaskCard(b: RouterBoardBinding, tasks: RouterTask[], options: { imageKey?: string; taskId?: string; notice?: string; projects?: Array<{ id: string; title: string }>; tools?: Array<{ name: string; subject?: string; completed?: boolean }> } = {}) {
+export function routerTaskCard(b: RouterBoardBinding, tasks: RouterTask[], options: { unified?: boolean; terminal?: string; imageKey?: string; taskId?: string; notice?: string; projects?: Array<{ id: string; title: string }>; tools?: Array<{ name: string; subject?: string; completed?: boolean }> } = {}) {
   const detail = tasks.find(t => t.id === options.taskId);
   const elements: any[] = [];
   if (options.notice) elements.push(md(safe(options.notice)));
@@ -39,12 +39,15 @@ export function routerTaskCard(b: RouterBoardBinding, tasks: RouterTask[], optio
     elements.push(button('刷新状态', value(b, undefined, 'refresh')));
   } else {
     const t = detail;
+    if (options.unified) elements.push(md(safe(t.coreWork || t.instruction.slice(0, 400) || t.title)));
     elements.push(md(`**${safe(t.title || '需求收集中')}**\n状态：${taskStates[t.state]} · r${t.revision}\n任务 ID：${t.id}\n方案版本：v${t.proposalRevision ?? t.revision}`));
     const panel = (title: string, text: string) => ({ tag: 'collapsible_panel', expanded: false,
       header: { title: plain(title) }, elements: [md(safe(text.slice(0, 12000)) || '暂无记录')] });
+    if (options.unified) elements.push(md(`**Router**：${t.projectOffer ? '等待选择任务归属' : t.promptNeedsInput ? '等待补充信息' : t.promptReview ? '等待确认改写消息' : t.approvalRequired ? '等待操作授权' : t.queued ? '排队等待执行' : taskStates[t.state]}\n**Session / 终端**：${safe(options.terminal || '尚未派发')}`));
     elements.push(panel('需求与完整方案', `项目：${t.project}\n执行目录：${t.isolated ? '独立临时目录（不保证只读）' : '项目 checkout'}\n\n${t.instruction}\n\n原始需求：\n${t.history.filter(h => h.role === 'user').slice(0, 3).map(h => h.text).join('\n')}`));
     elements.push(panel('执行节点 / session / 最近工具事件', `执行轮次：${t.attempt?.id ?? '未派发'}\nsession：${t.attempt?.sessionId ?? '未创建'}\n\n${options.tools?.map(tool => `${tool.completed ? '✓ 已返回' : '◐ 调用中'} ${tool.name} ${tool.subject ?? ''}`).join('\n') || '暂无公开工具事件。不展示隐藏推理，不猜测施工百分比。'}\n\n结果请查阅对应任务交付消息。`));
     elements.push(panel('审核记录', t.audit?.map(a => `${a.at} · ${a.action}\n${a.text ?? ''}`).join('\n\n') ?? '暂无卡片审核记录'));
+    if (t.promptNeedsInput) elements.push(md(safe(t.history.filter(h => h.role === 'assistant').at(-1)?.text || '请补充必要信息。')));
     if (t.promptReview && t.state !== 'cancelled') {
       elements.push(md('**即将发送的消息（尚未发送）**'));
       elements.push({ tag: 'div', text: plain(t.instruction || '请补充必要信息。') });
@@ -75,9 +78,9 @@ export function routerTaskCard(b: RouterBoardBinding, tasks: RouterTask[], optio
       fields.push(...ops.map(([label, op]) => button(label, value(b, t, op), true)));
       elements.push({ tag: 'form', name: 'router_review', elements: fields });
       elements.push(md('勾选本身不代表批准，必须点击提交。状态或版本变化后，旧表单操作会被拒绝。长期 Project 的补充将在原 session/task 继续，不冻结旧需求范围。'));
-    } else if (!t.projectOffer || t.state === 'cancelled') elements.push(md('该状态暂不允许本卡修改。执行问答请回复原受管问题；阻塞或派发不确定时不自动重试。'));
+    }
     elements.push(button('刷新本节点', value(b, t, 'view')));
   }
   return { schema: '2.0', config: { wide_screen_mode: true, enable_forward: false, update_multi: true },
-    header: { template: detail?.state === 'completed' ? 'green' : 'blue', title: plain(detail?.promptReview ? 'Router · 即将发送的消息' : detail ? 'Router · 节点查验与审核' : 'Router · 任务交互看板') }, body: { elements } };
+    header: { template: detail?.state === 'completed' ? 'green' : 'blue', title: plain(options.unified && detail ? detail.title || '任务' : detail?.promptReview ? 'Router · 即将发送的消息' : detail ? 'Router · 节点查验与审核' : 'Router · 任务交互看板') }, body: { elements } };
 }

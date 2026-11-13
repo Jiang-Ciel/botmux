@@ -55,6 +55,72 @@ describe('router board host CAS', () => {
     await board.handle(event(b, 'send_prompt', {}), 'app');
     expect(deps.execute).toHaveBeenCalledWith(expect.anything(), task, 'send_prompt', '', expect.any(String));
   });
+  it('uses one persisted task card through project choice, execution, refresh and completion without clobbering forms', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'router-unified-'));
+    let task: RouterTask = { ...sample, state: 'completed', coreWork: '讨论短途旅行方案', projectOffer: { title: '旅行', candidates: [] } };
+    const terminal = vi.fn(() => 'Pi · 执行中');
+    const { board, deps } = manager(root, { tasks: async () => [task], terminal,
+      execute: vi.fn(async () => { task = { ...task, revision: 4, state: 'running', projectOffer: undefined }; return ''; }) });
+    expect(await board.present(binding, task.id)).toBe(true); expect(deps.reply).toHaveBeenCalledTimes(1);
+    const [b] = JSON.parse(readFileSync(join(root, 'boards.json'), 'utf8'));
+    task = { ...task, revision: 4 }; await board.refreshAll(); expect(deps.patch).not.toHaveBeenCalled();
+    task = { ...task, revision: 3 };
+    await board.handle(event(b, 'direct_task', {}), 'app'); expect(deps.reply).toHaveBeenCalledTimes(1); expect(deps.patch).toHaveBeenCalled();
+    let card = (deps.patch as any).mock.calls.at(-1)[1];
+    expect(card.header.title.content).toBe(task.title); expect(JSON.stringify(card)).toContain('讨论短途旅行方案'); expect(JSON.stringify(card)).toContain('Session / 终端');
+    task = { ...task, revision: 5, state: 'completed' }; await board.refreshAll();
+    card = (deps.patch as any).mock.calls.at(-1)[1]; expect(JSON.stringify(card)).toContain('已完成'); expect(deps.reply).toHaveBeenCalledTimes(1);
+    const restored = new RouterBoardManager(root, deps); await restored.present(binding, task.id); expect(deps.reply).toHaveBeenCalledTimes(1);
+  });
+  it('does not force present over a running Project form and carries callback failures in the same card', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'router-unified-form-'));
+    const task = { ...sample, state: 'running' as const, conversationProjectId: 'project' };
+    const { board, deps } = manager(root, { tasks: async () => [task], execute: async () => '归并目标版本已变化，未执行。' });
+    await board.present(binding, task.id); await board.present(binding, task.id); await board.refreshAll();
+    expect(deps.reply).toHaveBeenCalledTimes(1); expect(deps.patch).not.toHaveBeenCalled();
+    const [b] = JSON.parse(readFileSync(join(root, 'boards.json'), 'utf8'));
+    await board.handle(event(b, 'supplement', { note: '问题' }), 'app');
+    expect(JSON.stringify((deps.patch as any).mock.calls.at(-1)[1])).toContain('归并目标版本已变化'); expect(deps.reply).toHaveBeenCalledTimes(1);
+  });
+  it('rebinds a merged card to the destination so confirmation and ticks do not create another card', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'router-unified-merge-'));
+    let source: RouterTask = { ...sample, projectOffer: { title: 'P', candidates: ['p'] } };
+    const dest: RouterTask = { ...sample, id: 'dest', state: 'review', promptReview: true, instruction: 'new complete prompt' };
+    const { board, deps } = manager(root, { tasks: async () => [dest, source], execute: async () => {
+      source = { ...source, state: 'cancelled', mergedIntoTaskId: dest.id, revision: 4, projectOffer: undefined }; return '';
+    } });
+    await board.present(binding, source.id); const [b] = JSON.parse(readFileSync(join(root, 'boards.json'), 'utf8'));
+    await board.handle(event(b, 'merge_project:p', {}), 'app');
+    const card = (deps.patch as any).mock.calls.at(-1)[1]; expect(JSON.stringify(card)).toContain('send_prompt');
+    expect(JSON.stringify(card)).toContain('dest');
+    await board.present(binding, dest.id); expect(deps.reply).toHaveBeenCalledTimes(1);
+    const restored = new RouterBoardManager(root, deps); await restored.present(binding, dest.id); expect(deps.reply).toHaveBeenCalledTimes(1);
+  });
+  it('an explicit merge refreshes the existing destination card even when it was protecting a form', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'router-unified-existing-merge-'));
+    let source: RouterTask = { ...sample, projectOffer: { title: 'P', candidates: ['p'] } };
+    let dest: RouterTask = { ...sample, id: 'dest', state: 'review' };
+    const { board, deps } = manager(root, { tasks: async () => [dest, source], execute: async () => {
+      source = { ...source, state: 'cancelled', mergedIntoTaskId: dest.id, revision: 4, projectOffer: undefined };
+      dest = { ...dest, revision: 4, promptReview: true, instruction: 'new merged prompt' }; return '';
+    } });
+    await board.present(binding, dest.id); await board.present(binding, source.id);
+    const bindings = JSON.parse(readFileSync(join(root, 'boards.json'), 'utf8'));
+    await board.handle(event(bindings.find((b: RouterBoardBinding) => b.taskId === source.id), 'merge_project:p', {}), 'app');
+    expect(deps.reply).toHaveBeenCalledTimes(2);
+    const patch = (deps.patch as any).mock.calls.find((call: any[]) => call[0].taskId === dest.id);
+    expect(patch).toBeDefined(); expect(JSON.stringify(patch[1])).toContain('send_prompt');
+    await board.refreshAll(); await board.present(binding, dest.id); expect(deps.reply).toHaveBeenCalledTimes(2);
+  });
+  it('reports uncertain delivery without replaying the card or claiming it was presented', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'router-unified-send-failure-'));
+    const { board, deps } = manager(root, { reply: vi.fn(async () => { throw new Error('transport uncertain'); }) });
+    expect(await board.present(binding, sample.id)).toBe(false);
+    expect(await board.present(binding, sample.id)).toBe(false); await board.refreshAll();
+    expect(deps.reply).toHaveBeenCalledTimes(1);
+    const restored = new RouterBoardManager(root, deps); expect(await restored.present(binding, sample.id)).toBe(false);
+    expect(deps.reply).toHaveBeenCalledTimes(1);
+  });
   it('renders a project creation card and requires a real callback to merge only offered projects', async () => {
     const task = { ...sample, projectOffer: { title: 'Python syntax', candidates: ['python-project'] } };
     const card = routerTaskCard({ ...binding, id: 'b' }, [task], { taskId: task.id, projects: [{ id: 'python-project', title: 'Python' }, { id: 'unrelated', title: 'Other' }] });

@@ -1873,6 +1873,7 @@ export function isResumeRecoveryPlaceholder(ds: DaemonSession): boolean {
 // takes effect without a daemon restart. The `/card` command can override it
 // per-session via `ds.streamingCardForced` (manually summon a live card).
 function streamingCardDisabled(ds: DaemonSession, turnId?: string): boolean {
+  if (ds.session.routerTask?.unifiedCard && !ds.streamingCardForced) return true;
   if (isSilentMessageListenerSession(ds.session)) return true;
   if (privateReplyEnabled(ds.session)) return true;
   if (isDocNativeSession(ds) || handoffCardBlocksStreaming(ds, turnId)) return true;

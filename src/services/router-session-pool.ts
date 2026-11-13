@@ -224,7 +224,7 @@ export class RouterSessionPool {
         dest.instruction = t.instruction || dest.instruction; dest.promptReview = t.promptReview; dest.promptNeedsInput = t.promptNeedsInput; dest.approvalRequired = t.approvalRequired === true;
         dest.proposalRevision = dest.revision + 1; dest.routingOrigin = t.routingOrigin ?? dest.routingOrigin; dest.conversations = [...new Set([...(dest.conversations ?? [dest.conversation]), input.conversation])];
         dest.sources ??= []; dest.sources.push(...(t.sources ?? [])); dest.revision++; dest.seen.push(input.messageId);
-        t.state = 'cancelled'; t.projectOffer = undefined; t.promptReview = false; t.promptNeedsInput = false; t.seen.push(input.messageId); t.revision++;
+        t.mergedIntoTaskId = dest.id; t.state = 'cancelled'; t.projectOffer = undefined; t.promptReview = false; t.promptNeedsInput = false; t.seen.push(input.messageId); t.revision++;
         return { result: this.claim(s, dest, input, p.sessionId) };
       }
       if (match) {
@@ -276,7 +276,7 @@ export class RouterSessionPool {
         if (old) draft.state = 'cancelled';
         return { kind: 'reply', text: decision.message };
       }
-      if (decision.action === 'reply') { draft.history.push({ role: 'assistant', text: decision.message }); return { kind: 'reply', text: decision.message }; }
+      if (decision.action === 'reply') { draft.history.push({ role: 'assistant', text: decision.message }); return { kind: 'reply', text: decision.message, responseOnly: true }; }
       const rewrite = snapshot.feedback || decision.promptMode === 'rewrite';
       if (snapshot.feedback && old) {
         const project = old.project || decision.project || input.projects[0] || '';
@@ -297,7 +297,7 @@ export class RouterSessionPool {
       if (targetId && !old) return { kind: 'reply', text: '相关任务不存在或不在授权范围；请重新指定。' };
       // Existing long projects accept changing educational/iterative requests.
       if (old?.conversationProjectId && (decision.action === 'continue' || !!snapshot.explicitTask)) {
-        old.history.push({ role: 'user', text: input.text, messageId: input.messageId }); old.instruction = rewrite ? decision.instruction : input.text; old.promptReview = rewrite; old.promptNeedsInput = false; old.coreWork = decision.message.trim().slice(0, 800) || old.title;
+        old.history.push({ role: 'user', text: input.text, messageId: input.messageId }); old.instruction = rewrite ? decision.instruction : input.text; old.title = decision.title || old.title; old.promptReview = rewrite; old.promptNeedsInput = false; old.coreWork = decision.message.trim().slice(0, 800) || old.title;
         old.revision++; old.proposalRevision = old.revision; old.conversations = [...new Set([...(old.conversations ?? [old.conversation]), input.conversation])];
         old.seen.push(input.messageId); old.routingOrigin = input.routingOrigin ?? old.routingOrigin; draft.state = 'cancelled';
         if (decision.requiresApproval) { old.approvalRequired = true; old.queued = true; if (!active(old)) old.state = 'proposed'; return { kind: 'reply', text: `${decision.message}\n- 本轮操作需要授权确认，已保留到原 Project，不执行。` }; }
@@ -315,7 +315,7 @@ export class RouterSessionPool {
           candidateRevisions: Object.fromEntries(candidates.map(id => { const p = s.projects.find(p => p.id === id)!; return [id, s.tasks.find(t => t.id === p.taskId)?.revision ?? -1]; })), relatedTaskId: old?.id };
         if (old && long) {
           // The card promotes the existing task/session, preserving identity.
-          old.history.push({ role: 'user', text: input.text, messageId: input.messageId }); old.instruction = draft.instruction; old.promptReview = draft.promptReview; old.coreWork = draft.coreWork; old.revision++;
+          old.history.push({ role: 'user', text: input.text, messageId: input.messageId }); old.instruction = draft.instruction; old.title = decision.title || old.title; old.promptReview = draft.promptReview; old.coreWork = draft.coreWork; old.revision++;
           old.projectOffer = draft.projectOffer; old.approvalRequired = draft.approvalRequired; old.proposalRevision = old.revision; old.conversations = [...new Set([...(old.conversations ?? [old.conversation]), input.conversation])];
           old.seen.push(input.messageId); old.routingOrigin = input.routingOrigin ?? old.routingOrigin; draft.state = 'cancelled'; draft.projectOffer = undefined; draft.promptReview = false;
           return { kind: 'reply', text: '- 这是连续研讨，已保留到原任务。请在对话卡片创建长期 Project，或确认归并到相似 Project；无需另开任务。' };

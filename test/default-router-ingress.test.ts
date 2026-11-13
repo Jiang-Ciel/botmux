@@ -28,7 +28,7 @@ function setup() {
   const ds: any = { workingDir: root, session: { ownerOpenId: 'owner', sessionId: 's', status: 'active' }, worker: { killed: false }, workerReady: true, lastScreenStatus: 'idle', larkAppId: 'app' };
   const scope = { getBot: () => ({ config: { workingDir: root, cliId: 'pi' } }), activeSessions: new Map([['anchor', ds]]),
     sessionKey: (anchor: string) => anchor, config: { session: { dataDir: root } },
-    routerBoards: { ensure: vi.fn(async () => {}), offerProject: vi.fn(async () => {}) },
+    routerBoards: { present: vi.fn(async () => true), ensure: vi.fn(async () => {}), offerProject: vi.fn(async () => {}) },
     ensureRouterPool: vi.fn(async () => {}), routerPoolRoutes: new Map(),
     routerTaskSummaryCard, routerProgressCard, interruptRouterProgress, DefaultRouter, canonicalRouterProjects, routerConversation, routerExecutionFacts, resolvePiModel, join,
     defaultRouters: new Map([['app:owner', { signature: JSON.stringify(['pi', undefined, undefined]), router: { handle, listTasks: async () => [] } }]]) };
