@@ -24918,6 +24918,7 @@ function deliverFinalOutput(
         });
       }
       ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+      if (ds.session.routerTask && (!msg.kind || msg.kind === 'bridge')) ds.routerDeliveredOutput = { turnId: msg.turnId, content: explicit?.finalText ?? safeAssistantText };
       markTurnReplyDelivered(ds, msg, effectiveCliId);
       logger.info(`[${t}] Bridge final_output forwarded (turn ${msg.turnId.substring(0, 8)}, ${msg.content.length} chars, kind=${msg.kind ?? 'bridge'}, attempt ${attempt + 1})`);
       if (messageId && !managedReceiver) {

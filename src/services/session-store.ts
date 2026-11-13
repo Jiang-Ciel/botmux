@@ -2181,7 +2181,8 @@ function persistRow(session: Session, modelPinWrite = false): void {
       // be erased by a stale metadata write or by changing workingDir.
       session = { ...session, workspaceRetirement: durable.workspaceRetirement };
     }
-    if (durable.routerTask) session = { ...session, routerTask: durable.routerTask };
+    if (durable.routerPool) session = { ...session, routerPool: durable.routerPool };
+    session = { ...session, routerTask: durable.routerTask };
     // Task continuation has its own compare-and-set writer. Metadata writers
     // holding an old row must neither erase a live task nor resurrect a stop.
     session = { ...session, deploymentContinuation: durable.deploymentContinuation };
@@ -3036,6 +3037,24 @@ export function updateSession(session: Session, options: { modelPinWrite?: true 
 }
 
 /** Exact task authority mutation; ordinary metadata updates cannot write it. */
+/** Only this CAS may rotate a reusable executor's current task identity. */
+export function updateRouterTask(session: Session, expected: Session['routerTask'], next: Session['routerTask']): void {
+  loadForWrite();
+  const db = ownStore;
+  if (!db) throw new SessionStoreUnavailableError(new Error('owned session store is not attached'));
+  const hit = db.selectRow.get(session.sessionId) as { row: string } | undefined;
+  if (!hit) throw new Error('router session missing');
+  const durable = JSON.parse(hit.row) as Session;
+  if (durable.status !== 'active' || durable.ownerOpenId !== session.ownerOpenId
+    || JSON.stringify(durable.routerTask) !== JSON.stringify(expected)) throw new Error('router task authority changed');
+  durable.routerTask = structuredClone(next);
+  if (Number(db.updateExact.run(sessionStatusText(durable), JSON.stringify(durable), session.sessionId, hit.row).changes) !== 1)
+    throw new Error('router session changed concurrently');
+  for (const target of new Set([session, sessions.get(session.sessionId)].filter((s): s is Session => !!s))) {
+    if (next) target.routerTask = structuredClone(next); else delete target.routerTask;
+  }
+}
+
 export function updateDeploymentContinuation(
   session: Session,
   expected: Session['deploymentContinuation'],

@@ -17,6 +17,9 @@ export const routerDecision = z.object({
   targetTaskId: z.string().optional(),
   newTask: z.boolean().optional(),
   isolated: z.boolean().optional(),
+  longTerm: z.boolean().optional(),
+  projectName: z.string().max(160).optional(),
+  similarProjectIds: z.array(z.string()).max(8).optional(),
   requiresApproval: z.boolean().optional(),
   proposals: z.array(z.object({ title: z.string().trim().min(1).max(160), project: z.string().max(4096), instruction: z.string().trim().min(1).max(32000), isolated: z.boolean().optional(), requiresApproval: z.boolean().optional() }).strict()).min(1).max(8).optional(),
 }).strict().refine(decision => decision.action !== 'propose' || decision.title.trim().length > 0, {
@@ -25,6 +28,9 @@ export const routerDecision = z.object({
 export type RouterDecision = z.infer<typeof routerDecision>;
 export interface RouterProvider { decide(context: RouterContext, signal: AbortSignal, onProgress?: (stage: RouterStage) => void): Promise<RouterDecision> }
 export interface RouterContext {
+  poolMode?: boolean;
+  explicitTaskId?: string;
+  conversationProjects?: Array<{ id: string; title: string; taskId: string; sessionId?: string }>;
   conversationId: string;
   message: string;
   projects: string[];
@@ -37,12 +43,20 @@ export interface RouterTask {
   conversations?: string[];
   sources?: Array<{ conversation: string; messageId: string; relation: string }>;
   isolated?: boolean;
+  routingOrigin?: { larkAppId: string; chatId: string; chatType: 'p2p' | 'group'; scope: 'chat' | 'thread'; anchor: string };
+  conversationProjectId?: string;
+  projectOffer?: { title: string; candidates: string[]; relatedTaskId?: string };
+  poolSlotId?: string;
+  executionDirectory?: string;
+  queued?: boolean;
+  lastResponse?: string;
   waitingInput?: boolean;
   approvalRequired?: boolean;
   proposalId?: string;
   proposalRevision?: number;
   attempts?: Array<{ id: string; turnId: string; sessionId?: string }>;
   owner: string;
+  audit?: Array<{ messageId: string; action: string; text?: string; at: string; revision: number }>;
   revision: number;
   state: 'collecting' | 'proposed' | 'dispatching' | 'running' | 'review' | 'blocked' | 'cancelled' | 'completed';
   title: string;
@@ -55,21 +69,25 @@ export interface RouterTask {
 interface Ledger { version: 1; tasks: RouterTask[] }
 export interface RouterInput {
   conversation: string; owner: string; messageId: string; text: string; controlText?: string; projects: string[];
-  execution?: { sessionId: string; busy: boolean; waiting: boolean; closed: boolean; interrupted: boolean; delivered: boolean; turnId?: string; response?: string };
+  execution?: { sessionId: string; busy: boolean; waiting: boolean; closed: boolean; interrupted: boolean; delivered: boolean; turnId?: string; response?: string; workingDir?: string; dormant?: boolean };
   executions?: NonNullable<RouterInput['execution']>[];
   targetTaskId?: string;
+  /** Card CAS is checked in the same locked transaction as the mutation. */
+  expectedRevision?: number;
+  reviewNote?: string;
   onProgress?: RouterProgressSink;
   projectBusy?: (project: string, excludeSessionId?: string) => boolean;
 }
-export function routerExecutionFacts(ds: Pick<DaemonSession, 'session' | 'worker' | 'workerReady' | 'lastScreenStatus' | 'pendingRepo' | 'tuiPromptCardId' | 'agentAttention' | 'lastScreenContent'>): NonNullable<RouterInput['execution']> {
+export function routerExecutionFacts(ds: Pick<DaemonSession, 'session' | 'worker' | 'workerReady' | 'lastScreenStatus' | 'pendingRepo' | 'tuiPromptCardId' | 'agentAttention' | 'lastScreenContent' | 'workingDir' | 'completedIdleTurnId' | 'currentTurnId' | 'routerDeliveredOutput'>): NonNullable<RouterInput['execution']> {
   const status = ds.session.queued ? 'idle' : (!ds.worker || ds.worker.killed ? 'dormant'
     : ds.lastScreenStatus ?? (ds.workerReady === true ? 'working' : 'starting'));
+  const routed = ds.routerDeliveredOutput && ds.routerDeliveredOutput.turnId === ds.currentTurnId ? ds.routerDeliveredOutput : undefined;
   return { sessionId: ds.session.sessionId,
     busy: ['starting', 'working', 'analyzing', 'active'].includes(status),
-    waiting: !!ds.tuiPromptCardId || !!ds.agentAttention || !!ds.pendingRepo || routerNeedsInput(ds.lastScreenContent),
+    waiting: !!ds.tuiPromptCardId || !!ds.agentAttention || !!ds.pendingRepo || routerNeedsInput(routed?.content ?? ds.lastScreenContent),
     closed: ds.session.status === 'closed',
-    interrupted: ds.session.lastTurn?.outcome === 'interrupted',
-    delivered: ds.session.lastTurn?.outcome === 'delivered', turnId: ds.session.lastTurn?.turnId, response: ds.lastScreenContent };
+    interrupted: ds.session.lastTurn?.outcome === 'interrupted' && !routed && !(ds.completedIdleTurnId && ds.completedIdleTurnId === ds.currentTurnId),
+    delivered: !!routed || ds.session.lastTurn?.outcome === 'delivered' || !!ds.completedIdleTurnId && ds.completedIdleTurnId === ds.currentTurnId, turnId: routed?.turnId ?? (ds.completedIdleTurnId === ds.currentTurnId && ds.completedIdleTurnId ? ds.completedIdleTurnId : ds.session.lastTurn?.turnId), response: routed?.content ?? ds.lastScreenContent, workingDir: ds.workingDir, dormant: !ds.worker || ds.worker.killed };
 }
 export interface RouterDispatch { instruction: string; project: string; attemptId: string; taskId?: string; title?: string; sourceMessageId?: string; sessionId?: string; summary?: string }
 export type RouterResult = { kind: 'reply'; text: string } | ({ kind: 'dispatch'; additional?: RouterDispatch[] } & RouterDispatch);
@@ -162,6 +180,22 @@ export class DefaultRouter {
       const candidates = explicit ? ledger.tasks.filter(t => t.owner === input.owner && (t.id === explicit || t.id.startsWith(explicit)) && (!t.project || input.projects.includes(t.project)))
         : match ? linked.filter(t => /^(批准执行|approve task)$/i.test(match[1]) ? t.state === 'proposed' : /^(验收完成|accept task)$/i.test(match[1]) ? t.state === 'review' : !['cancelled', 'completed'].includes(t.state)) : [];
       if ((match || explicit) && candidates.length !== 1) return { reply: candidates.length ? `请指定任务 ID 和方案版本：\n${candidates.map(t => `${t.id} v${t.proposalRevision ?? t.revision}｜${t.title}｜${t.state}`).join('\n')}` : '没有匹配的可操作任务，请先形成方案或指定正确任务 ID。' };
+      if (input.expectedRevision !== undefined) {
+        const target = candidates[0];
+        if (!target || !linked.includes(target) || target.revision !== input.expectedRevision)
+          return { reply: '任务状态或方案已变化，请刷新卡片后重新确认。' };
+        const action = match?.[1] ?? 'supplement';
+        if (!match && !['collecting', 'proposed', 'review'].includes(target.state))
+          return { reply: '执行中的补充请使用原受管问题；本卡片不会自动注入运行任务。' };
+        target.audit ??= [];
+        target.audit.push({ messageId: input.messageId, action, text: input.reviewNote?.slice(0, 4000), at: new Date().toISOString(), revision: target.revision });
+        target.audit = target.audit.slice(-100);
+        if (!match && target.state === 'review') {
+          target.history.push({ role: 'user', text: text.slice(0, 4000) });
+          target.revision++; target.seen.push(input.messageId);
+          return { reply: '验收意见已记录，任务仍待验收；首版不会自动派发返工或释放项目栅栏。' };
+        }
+      }
       let task = candidates[0] ?? ([...linked].reverse().find(t => ['running', 'review', 'dispatching', 'blocked'].includes(t.state))) ?? [...linked].reverse().find(t => ['collecting', 'proposed'].includes(t.state));
       if (!task) {
         task = { id: randomUUID(), conversation: input.conversation, conversations: [input.conversation], sources: [], owner: input.owner, revision: 0, state: 'collecting', title: '', project: '', instruction: '', history: [], seen: [] };
@@ -307,9 +341,13 @@ export class DefaultRouter {
       return { kind: 'reply', text: decision.message || '请补充目标项目、需求和验收条件。' };
     });
   }
-  async reconcile(executions: NonNullable<RouterInput['execution']>[]): Promise<void> {
+  async listTasks(owner?: string, conversation?: string): Promise<RouterTask[]> {
+    return this.transaction(ledger => structuredClone(ledger.tasks.filter(t => (!owner || t.owner === owner)
+      && (!conversation || t.conversation === conversation || t.conversations?.includes(conversation)))));
+  }
+  async reconcile(executions: NonNullable<RouterInput['execution']>[], ownerPrefix?: string): Promise<void> {
     await this.transaction(ledger => {
-      for (const task of ledger.tasks.filter(t => t.state === 'running')) {
+      for (const task of ledger.tasks.filter(t => t.state === 'running' && (!ownerPrefix || t.owner.startsWith(ownerPrefix)))) {
         const facts = executions.find(e => e.sessionId === task.attempt?.sessionId);
         const next = !facts || facts.closed || facts.interrupted ? 'blocked'
           : facts.delivered && facts.turnId === task.attempt?.turnId && !facts.busy && !facts.waiting && !routerNeedsInput(facts.response) ? 'review' : 'running';

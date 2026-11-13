@@ -6,7 +6,7 @@ import { sessionContractStore } from './services/session-contract-store.js';
 import { recordDeploymentContinuation, cancelDeploymentContinuation } from './services/deployment-continuation.js';
 import { deploymentContinuationAuthority } from './core/deployment-continuation-authority.js';
 import { shareVcMeetingSummary } from './services/vc-meeting-summary-share.js';
-import { getChatRoutingFacts, isCurrentBotInChat, resolveUnionIdFromOpenIdStrict } from './im/lark/client.js';
+import { uploadImage, getChatRoutingFacts, isCurrentBotInChat, resolveUnionIdFromOpenIdStrict } from './im/lark/client.js';
 import { handleSandboxSendRouteRequest, SANDBOX_SEND_ROUTE_AUTHORIZE_ROUTE } from './core/sandbox-send-route.js';
 import { currentGatewayCallerOpenId } from './core/gateway-turn-caller.js';
 import { createBotAdminUnionsPublisher, readBotAdminUnions } from './services/bot-admin-unions-store.js';
@@ -49,6 +49,10 @@ import { getLarkConnectionHealth, type LarkConnectionHealth } from './im/lark/tr
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { DefaultRouter, canonicalRouterProjects, routerConversation, routerExecutionFacts } from './services/default-router.js';
 import { interruptRouterProgress, routerProgressCard, type RouterProgress } from './services/router-progress.js';
+import { RouterBoardManager } from './services/router-board.js';
+import { routerTaskGraph } from './services/router-task-graph.js';
+import { publicReplyCardTools } from './im/lark/turn-reply-card.js';
+import { RouterSessionPool } from './services/router-session-pool.js';
 import { PiRouterProvider } from './services/default-router-pi.js';
 import { resolvePiModel } from './adapters/cli/pi-model.js';
 import { readPeerCrossRef } from './services/peer-cross-ref-store.js';
@@ -5084,7 +5088,7 @@ async function sessionReply(
   if (ds?.session.routerTask && msgType === 'text') {
     content = `【${ds.session.routerTask.title}｜${ds.session.routerTask.taskId.slice(0, 8)}】\n${content}`;
     if (!opts?.quoteMessageId && ds.scope === 'chat' && (!opts?.replyTarget || opts.replyTarget.mode === 'plain')) {
-      opts = { ...opts, quoteMessageId: ds.session.routerTask.sourceMessageId };
+      opts = { ...opts, quoteMessageId: ds.session.routerTask!.sourceMessageId };
     }
   }
   const appId = larkAppId ?? ds?.larkAppId ?? getAllBots()[0]?.config.larkAppId;
@@ -8166,7 +8170,10 @@ const cardActionPluginGateway = createPluginCardActionGateway({
     getBot(larkAppId).config,
     readGlobalConfig(),
   ),
-  fallback: (data, larkAppId) => handleCardAction(data, cardDeps, larkAppId),
+  fallback: async (data, larkAppId) => {
+    const routerResult = await routerBoards.handle(data, larkAppId);
+    return routerResult ?? handleCardAction(data, cardDeps, larkAppId);
+  },
   // Identity comes only from the SDK-verified envelope operator and the
   // callback context's chat; card values never feed this decision.
   resolvePrivileges: resolvePluginCardPrivileges,
@@ -26428,22 +26435,120 @@ function handleDocumentAskTextReply(data: any, ctx: RoutingContext): boolean {
   });
 }
 
-const defaultRouters = new Map<string, { signature: string; router: DefaultRouter; provider: PiRouterProvider }>();
+const defaultRouters = new Map<string, { signature: string; router: RouterSessionPool; provider: PiRouterProvider }>();
 process.once('exit', () => { for (const entry of defaultRouters.values()) entry.provider.close(); });
+const routerBoardReader = new RouterSessionPool(join(config.session.dataDir, 'agent-router'), {
+  decide: async () => { throw new Error('read_only_router'); },
+});
+const routerBoards = new RouterBoardManager(join(config.session.dataDir, 'agent-router'), {
+  namespace: () => selfDaemonLarkAppId,
+  tasks: async b => {
+    await routerBoardReader.reconcile([...activeSessions.values()].map(routerExecutionFacts), `${b.app}:`);
+    return routerBoardReader.listTasks(`${b.app}:${b.owner}`, b.conversation);
+  },
+  allowed: (b, openId, unionId) => getBot(b.app).config.agentRouter !== false && canOperate(b.app, b.chatId, openId, unionId),
+  reply: (b, card, uuid) => replyMessage(b.app, b.sourceMessageId, JSON.stringify(card), 'interactive', b.scope === 'thread', uuid),
+  patch: (b, card) => updateMessage(b.app, b.messageId!, JSON.stringify(card)),
+  graph: async (tasks, app) => uploadImage(app, await routerTaskGraph(tasks)),
+  projects: b => routerBoardReader.listProjects(`${b.app}:${b.owner}`),
+  tools: task => {
+    const ds = [...activeSessions.values()].find(ds => ds.session.sessionId === task.attempt?.sessionId);
+    return ds && ds.lastThinkingUpdate && ds.lastThinkingUpdate.turnId === task.attempt?.turnId
+      ? publicReplyCardTools(ds.lastThinkingUpdate.entries, false).slice(-30) : [];
+  },
+  execute: async (b, task, op, note, messageId) => {
+    const command = op === 'approve' ? `批准执行 ${task.id} v${task.proposalRevision ?? task.revision}`
+      : op === 'accept' ? `验收完成 ${task.id}` : op === 'cancel' ? `取消任务 ${task.id}` : 'router card supplement';
+    const result = await routeOrdinaryHuman({ ctx: { larkAppId: b.app, chatId: b.chatId, chatType: b.chatType,
+      scope: b.scope, anchor: b.anchor, messageId: b.sourceMessageId },
+      data: { sender: { sender_type: 'user', sender_id: { open_id: b.owner } } },
+      command, text: ['supplement', 'create_project'].includes(op) || op.startsWith('merge_project:') ? note || task.title : command, resources: [], card: { messageId, taskId: task.id, revision: task.revision, note, projectAction: op === 'create_project' ? 'create' : op.startsWith('merge_project:') ? 'merge' : undefined, mergeProjectId: op.startsWith('merge_project:') ? op.slice('merge_project:'.length) : undefined } });
+    return result?.kind === 'reply' ? result.text : '当前入口不可操作；任务未获新增派发，请核查受管执行会话。';
+  },
+  error: () => logger.warn('[router] task board transport failed; ledger unchanged'),
+});
 let routerReconcilePending = false;
 const routerReconcileTimer = setInterval(() => {
-  if (routerReconcilePending || !defaultRouters.size) return;
+  if (routerReconcilePending) return;
   routerReconcilePending = true;
   const facts = [...activeSessions.values()].map(routerExecutionFacts);
   // All providers share this daemon ledger. Reconcile once, independently of input analysis.
-  void defaultRouters.values().next().value!.router.reconcile(facts)
+  void (selfDaemonLarkAppId ? routerBoardReader.reconcile(facts, `${selfDaemonLarkAppId}:`).then(async () => { await drainRouterPools(); await routerBoards.refreshAll(); }) : Promise.resolve())
     .catch(() => logger.warn('[router] execution reconciliation failed'))
     .finally(() => { routerReconcilePending = false; });
 }, 5000);
 routerReconcileTimer.unref?.();
+const routerPoolRoutes = new Map<string, { ctx: RoutingContext; data: any; projects: string[] }>();
+async function ensureRouterPool(router: RouterSessionPool, ctx: RoutingContext, data: any, size: number) {
+  const owner = data.sender.sender_id.open_id as string;
+  const key = `${ctx.larkAppId}:${owner}`;
+  await router.retireClosedSlots(key, [...activeSessions.values()].filter(ds => ds.larkAppId === ctx.larkAppId).map(routerExecutionFacts));
+  const reserved = await router.reserveSlots(key, size);
+  const unattempted = new Set(reserved.map(slot => slot.id));
+  try { for (const slot of reserved) {
+    const workingDir = router.slotDirectory(key, slot.id);
+    const session = sessionStore.createSession(ctx.chatId, ctx.anchor, 'Router pool', ctx.chatType, undefined, { source: 'ordinary-feishu' });
+    session.larkAppId = ctx.larkAppId; session.scope = ctx.scope; session.ownerOpenId = owner;
+    session.ownerUnionId = data.sender.sender_id.union_id; session.creatorOpenId = owner; session.workingDir = workingDir;
+    session.routerPool = { slotId: slot.id, owner: key }; sessionStore.updateSession(session);
+    const ds: DaemonSession = { session, worker: null, workerPort: null, workerToken: null, larkAppId: ctx.larkAppId,
+      chatId: ctx.chatId, chatType: ctx.chatType, scope: ctx.scope, spawnedAt: Date.now(), cliVersion: 'unknown',
+      lastMessageAt: Date.now(), hasHistory: false, workingDir, ownerOpenId: owner };
+    if (!(await claimNewDaemonSession(activeSessions, ds)).accepted) throw new Error('router_pool_registration_failed');
+    unattempted.delete(slot.id);
+    await router.bindSlot(slot.id, key, session.sessionId, workingDir);
+    forkReservedIdleSession(ds);
+  } } finally { for (const id of unattempted) await router.releaseSlotCreation(id, key); }
+  for (const slot of await router.listSlots(key)) {
+    if (slot.taskId || !slot.sessionId) continue;
+    const ds = [...activeSessions.values()].find(ds => ds.larkAppId === ctx.larkAppId && ds.session.sessionId === slot.sessionId);
+    if (ds && !ds.worker && ds.session.status !== 'closed' && !ds.pendingRepo && !ds.agentAttention && !ds.tuiPromptCardId)
+      forkWorker(ds, '', true);
+  }
+}
+async function drainRouterPools() {
+  const durableTasks = await routerBoardReader.listTasks();
+  for (const task of durableTasks) {
+    const origin = task.routingOrigin;
+    if (!origin || origin.larkAppId !== selfDaemonLarkAppId || routerPoolRoutes.has(task.owner)) continue;
+    const owner = task.owner.slice(origin.larkAppId.length + 1);
+    const cfg = getBot(origin.larkAppId).config;
+    if (cfg.agentRouter === false || !owner || !canOperate(origin.larkAppId, origin.chatId, owner)) continue;
+    const options = cfg.agentRouter || {};
+    const env = { ...process.env, ...cfg.env };
+    const executable = options.executable ?? (cfg.cliId === 'pi' ? cfg.cliPathOverride : undefined) ?? 'pi';
+    const model = resolvePiModel(options.model ?? (cfg.cliId === 'pi' ? cfg.model : undefined), { env });
+    const modelFlag = model.kind === 'none' ? undefined : model.flag;
+    const provider = new PiRouterProvider({ executable, model: modelFlag, env, owner, cwd: join(config.session.dataDir, 'agent-router', 'internal') });
+    defaultRouters.set(task.owner, { signature: JSON.stringify([executable, modelFlag, cfg.env]), provider,
+      router: new RouterSessionPool(join(config.session.dataDir, 'agent-router'), provider) });
+    routerPoolRoutes.set(task.owner, { ctx: { ...origin, messageId: task.sources?.at(-1)?.messageId ?? task.id },
+      data: { sender: { sender_type: 'user', sender_id: { open_id: owner } } },
+      projects: canonicalRouterProjects([cfg.workingDir ?? '', ...(cfg.workingDirs ?? [])]) });
+  }
+
+  for (const [key, route] of routerPoolRoutes) {
+    const entry = defaultRouters.get(key); if (!entry) continue;
+    if (getBot(route.ctx.larkAppId).config.agentRouter === false || !canOperate(route.ctx.larkAppId, route.ctx.chatId, route.data.sender.sender_id.open_id)) continue;
+    const facts = [...activeSessions.values()].filter(ds => ds.larkAppId === route.ctx.larkAppId).map(routerExecutionFacts);
+    const results = await entry.router.drain({ conversation: '', owner: key, messageId: route.ctx.messageId,
+      text: '', projects: route.projects, executions: facts,
+      projectBusy: (project, exclude) => [...activeSessions.values()].some(ds => ds.session.sessionId !== exclude
+        && canonicalRouterProjects([ds.workingDir ?? ''])[0] === project && (routerExecutionFacts(ds).busy || routerExecutionFacts(ds).waiting)) });
+    for (const result of results) {
+      const task = (await entry.router.listTasks(key)).find(t => t.id === result.taskId);
+      const origin = task?.routingOrigin;
+      const ctx = origin ? { ...route.ctx, ...origin, messageId: result.sourceMessageId ?? route.ctx.messageId } : route.ctx;
+      const reply = await dispatchOrdinaryRouterTask(result, entry.router, ctx, route.data);
+      await sessionReply(ctx.anchor, reply, 'text', ctx.larkAppId);
+    }
+    await ensureRouterPool(entry.router, route.ctx, route.data, getBot(route.ctx.larkAppId).config.agentRouter && getBot(route.ctx.larkAppId).config.agentRouter !== false ? (getBot(route.ctx.larkAppId).config.agentRouter as { poolSize?: number }).poolSize ?? 4 : 4);
+  }
+}
 async function routeOrdinaryHuman(input: {
   ctx: RoutingContext; data: any; text: string; command: string; resources: MessageResource[];
   project?: string; skip?: boolean;
+  card?: { messageId: string; taskId: string; revision: number; note: string; projectAction?: 'create' | 'merge'; mergeProjectId?: string };
 }): Promise<import('./services/default-router.js').RouterResult | undefined> {
   const { ctx, data } = input;
   const cfg = getBot(ctx.larkAppId).config;
@@ -26487,12 +26592,14 @@ async function routeOrdinaryHuman(input: {
     interruptRouterProgress(join(config.session.dataDir, 'agent-router'), key);
     const provider = new PiRouterProvider({ executable, model: modelFlag, env, owner,
       cwd: join(config.session.dataDir, 'agent-router', 'internal') });
-    entry = { signature, provider, router: new DefaultRouter(join(config.session.dataDir, 'agent-router'), provider) };
+    entry = { signature, provider, router: new RouterSessionPool(join(config.session.dataDir, 'agent-router'), provider) };
     defaultRouters.set(key, entry);
   }
   const pinned = ds ? ds.workingDir : (await resolvePinnedWorkingDir({ scope: ctx.scope, anchor: ctx.anchor,
     chatId: ctx.chatId, chatType: ctx.chatType, larkAppId: ctx.larkAppId })).pinnedWorkingDir;
   const projects = canonicalRouterProjects([input.project ?? pinned ?? cfg.workingDir ?? '', ...(cfg.workingDirs ?? [])]);
+  await ensureRouterPool(entry.router, ctx, data, options.poolSize ?? 4);
+  routerPoolRoutes.set(key, { ctx, data, projects });
   let latest: RouterProgress | undefined;
   let cardId: string | undefined;
   let cardWork = Promise.resolve();
@@ -26509,24 +26616,33 @@ async function routeOrdinaryHuman(input: {
   let result: import('./services/default-router.js').RouterResult;
   try { result = await entry.router.handle({
     conversation: routerConversation(ctx.larkAppId, ctx.chatId, ctx.scope, ctx.anchor, owner),
-    owner: `${ctx.larkAppId}:${owner}`, messageId: ctx.messageId, text: input.text, controlText: input.command, projects,
+    owner: `${ctx.larkAppId}:${owner}`, messageId: input.card?.messageId ?? ctx.messageId, text: input.text, controlText: input.command, projects,
+    targetTaskId: input.card?.taskId, expectedRevision: input.card?.revision, reviewNote: input.card?.note,
+    routingOrigin: { larkAppId: ctx.larkAppId, chatId: ctx.chatId, chatType: ctx.chatType, scope: ctx.scope, anchor: ctx.anchor },
+    projectAction: input.card?.projectAction, mergeProjectId: input.card?.mergeProjectId, projectName: input.card?.note,
     onProgress: value => { latest = value; paintProgress(!!value.finishedAt); },
     executions: [...activeSessions.values()].filter(other => other.larkAppId === ctx.larkAppId).map(routerExecutionFacts),
     projectBusy: (project, excludeSessionId) => [...activeSessions.values()].some(other =>
       other.session.sessionId !== excludeSessionId && canonicalRouterProjects([other.workingDir ?? ''])[0] === project
       && (routerExecutionFacts(other).busy || routerExecutionFacts(other).waiting)),
   }); } finally { clearInterval(timer); }
-  if (result.kind !== 'dispatch') return result;
+  if (!input.card) await routerBoards.ensure({ app: ctx.larkAppId, owner, chatId: ctx.chatId, chatType: ctx.chatType,
+    scope: ctx.scope, anchor: ctx.anchor, sourceMessageId: ctx.messageId,
+    conversation: routerConversation(ctx.larkAppId, ctx.chatId, ctx.scope, ctx.anchor, owner) }).catch(() => logger.warn('[router] task board creation failed'));
+  if (result.kind !== 'dispatch') {
+    if (!input.card) await routerBoards.offerProject({ app: ctx.larkAppId, owner, chatId: ctx.chatId, chatType: ctx.chatType, scope: ctx.scope, anchor: ctx.anchor, sourceMessageId: ctx.messageId, conversation: routerConversation(ctx.larkAppId, ctx.chatId, ctx.scope, ctx.anchor, owner) });
+    return result;
+  }
   const replies: string[] = [];
   for (const task of [result, ...(result.additional ?? [])]) {
-    replies.push(await dispatchOrdinaryRouterTask(task, entry.router, ctx, data));
+    replies.push(await dispatchOrdinaryRouterTask(task, entry.router, { ...ctx, messageId: input.card?.messageId ?? ctx.messageId }, data));
   }
   return { kind: 'reply', text: replies.join('\n\n') };
 
 }
 async function dispatchOrdinaryRouterTask(
   result: import('./services/default-router.js').RouterDispatch,
-  router: DefaultRouter, ctx: RoutingContext, data: any,
+  router: Pick<DefaultRouter, 'bind' | 'finish' | 'rejectContinuation'>, ctx: RoutingContext, data: any,
 ): Promise<string> {
   const cfg = getBot(ctx.larkAppId).config;
   const owner = data.sender.sender_id.open_id as string;
@@ -26542,9 +26658,9 @@ async function dispatchOrdinaryRouterTask(
   if (result.sessionId) {
     const executor = [...activeSessions.values()].find(other => other.session.sessionId === result.sessionId
       && other.larkAppId === ctx.larkAppId && other.session.ownerOpenId === owner
-      && other.session.routerTask?.taskId === result.taskId);
+      && (other.session.routerTask?.taskId === result.taskId || other.session.routerPool?.owner === `${ctx.larkAppId}:${owner}`));
     if (!executor || routerExecutionFacts(executor).busy || routerExecutionFacts(executor).interrupted || executor.session.status === 'closed'
-      || !executor.worker || executor.worker.killed || executor.pendingRepo || executor.tuiPromptCardId || executor.agentAttention)
+      || executor.pendingRepo || executor.tuiPromptCardId || executor.agentAttention)
       return rejectUnsent('原执行会话不可用、仍忙或等待受管交互；补充已保留，不会新起会话。');
     const worker = executor.worker;
     const generation = executor.session.workerGeneration;
@@ -26553,8 +26669,8 @@ async function dispatchOrdinaryRouterTask(
     const caller = await trustedCallerForInboundTurn(ctx.larkAppId, owner, executor.session.ownerUnionId, false, ctx.messageId);
     await router.bind(result.attemptId, executor.session.sessionId);
     if (![...activeSessions.values()].includes(executor) || executor.larkAppId !== ctx.larkAppId
-      || executor.session.ownerOpenId !== owner || executor.session.routerTask?.taskId !== result.taskId
-      || executor.workingDir !== workingDir || executor.worker !== worker || worker.killed || executor.session.workerGeneration !== generation
+      || executor.session.ownerOpenId !== owner || !(executor.session.routerTask?.taskId === result.taskId || executor.session.routerPool?.owner === `${ctx.larkAppId}:${owner}`)
+      || executor.workingDir !== workingDir || executor.worker !== worker || worker?.killed || executor.session.workerGeneration !== generation
       || executor.session.cliSessionId !== nativeThread || routerExecutionFacts(executor).closed || routerExecutionFacts(executor).interrupted
       || executor.pendingRepo || executor.tuiPromptCardId || executor.agentAttention || routerExecutionFacts(executor).busy)
       return rejectUnsent('原执行会话已变化；本次未注入，不会新起会话。');
@@ -26570,23 +26686,43 @@ async function dispatchOrdinaryRouterTask(
       ...bindingKeys.map(key => ({ target: executor.session, key, descriptor: Object.getOwnPropertyDescriptor(executor.session, key) })),
       ...['replyThreadAliases', 'currentReplyTarget'].map(key => ({ target: executor, key, descriptor: Object.getOwnPropertyDescriptor(executor, key) })),
     ];
+    executor.session.quoteTargetId = ctx.messageId;
+    executor.session.quoteTargetSenderOpenId = owner;
+    executor.session.quoteTargetSenderIsBot = false;
     beginReplyTargetTurn(executor, ctx.scope === 'thread' ? ctx.anchor : undefined, ctx.messageId,
       new Date().toISOString(), { senderOpenId: owner, sourceMessageId: result.sourceMessageId,
+        routerOrigin: { scope: ctx.scope, chatId: ctx.chatId, threadRootId: ctx.anchor },
         participants: [{ openId: owner, isBot: false }], participantsIncomplete: false, inThread: ctx.scope === 'thread' });
-    if (!sendWorkerInput(executor, payload, ctx.messageId, { trustedCaller: caller, atMostOnce: true })) {
+    const previousTask = structuredClone(executor.session.routerTask);
+    const nextTask = { taskId: result.taskId!, attemptId: result.attemptId, sourceMessageId: result.sourceMessageId ?? ctx.messageId, title: result.title ?? 'Task' };
+    sessionStore.updateRouterTask(executor.session, previousTask, nextTask);
+    sessionStore.updateSession(executor.session);
+    const restoreUnsent = async () => {
+      sessionStore.updateRouterTask(executor.session, nextTask, previousTask);
       for (const { target, key, descriptor } of bindings) {
         if (descriptor) Object.defineProperty(target, key, descriptor); else Reflect.deleteProperty(target, key);
       }
       sessionStore.updateSession(executor.session);
-      return rejectUnsent('原执行会话未接纳补充；已恢复原任务状态，不会另起任务。');
-    }
+      await router.rejectContinuation(result.attemptId);
+    };
+    const cold = !executor.worker || executor.worker.killed;
+    let admission: 'accepted' | 'rejected' | 'deferred' | undefined;
+    const accepted = cold ? forkWorker(executor, payload, { turnId: ctx.messageId, trustedCaller: caller, resume: true }, {
+      onAdmission: value => {
+        admission = value;
+        if (value === 'accepted') { markIngressAdmitted(ctx); void router.finish(result.attemptId, executor.session.sessionId, true).catch(() => logger.error('[router] cold settlement persistence failed')); }
+        if (value === 'rejected') void restoreUnsent().catch(() => logger.error('[router] cold rejection compensation failed'));
+      },
+    }) : sendWorkerInput(executor, payload, ctx.messageId, { trustedCaller: caller, atMostOnce: true });
+    if (!accepted && admission !== 'rejected') await restoreUnsent();
+    if (!accepted || admission === 'rejected') return '原执行会话未接纳输入；已恢复原绑定，任务等待重试。';
     markIngressAdmitted(ctx);
     beginNewTurn(executor, result.instruction, ctx.messageId);
     rememberLastCliInput(executor, result.instruction, payload, ctx.messageId);
-    executor.session.routerTask!.attemptId = result.attemptId;
+    executor.session.quoteTargetId = ctx.messageId; executor.session.quoteTargetSenderOpenId = owner;
     markSessionActivity(executor, Date.now(), { human: true }); sessionStore.updateSession(executor.session);
-    await router.finish(result.attemptId, executor.session.sessionId, true);
-    return `${result.summary ?? `- 延续任务：${result.title}`}\n- 原后台 session：${executor.session.sessionId}`;
+    if (!cold) await router.finish(result.attemptId, executor.session.sessionId, true);
+    return `${result.summary ?? `- 延续任务：${result.title}`}\n- 原后台 session：${executor.session.sessionId}${cold && admission !== 'accepted' ? '\n- 冷启动等待最终接纳；失败将恢复绑定并排队，不表示已执行。' : ''}`;
   }
   const session = sessionStore.createSession(ctx.chatId, ctx.scope === 'thread' ? ctx.anchor : ctx.messageId,
     result.title ?? 'Router task', ctx.chatType, undefined, { source: 'ordinary-feishu' });
@@ -26594,16 +26730,17 @@ async function dispatchOrdinaryRouterTask(
   session.ownerOpenId = owner; session.ownerUnionId = data?.sender?.sender_id?.union_id;
   session.creatorOpenId = owner; session.lastCallerOpenId = owner; session.workingDir = result.project;
   session.quoteTargetId = result.sourceMessageId ?? ctx.messageId; session.quoteTargetSenderOpenId = owner;
-  session.routerTask = { taskId: result.taskId!, attemptId: result.attemptId,
-    sourceMessageId: result.sourceMessageId ?? ctx.messageId, title: result.title ?? 'Router task' };
+  sessionStore.updateRouterTask(session, undefined, { taskId: result.taskId!, attemptId: result.attemptId,
+    sourceMessageId: result.sourceMessageId ?? ctx.messageId, title: result.title ?? 'Router task' });
   session.nativeSessionTitle = result.title; session.nativeSessionTitleUserDefined = true;
   stampHumanActivity(session, Date.now()); sessionStore.updateSession(session);
   const executor: DaemonSession = { session, worker: null, workerPort: null, workerToken: null,
     larkAppId: ctx.larkAppId, chatId: ctx.chatId, chatType: ctx.chatType, scope: ctx.scope,
     spawnedAt: Date.now(), cliVersion: 'unknown', lastMessageAt: Date.now(), hasHistory: false,
     workingDir: result.project, ownerOpenId: owner };
-  beginReplyTargetTurn(executor, ctx.scope === 'thread' ? ctx.anchor : undefined, ctx.messageId,
-    new Date().toISOString(), { senderOpenId: owner, sourceMessageId: session.routerTask.sourceMessageId,
+  const executionTurnId = ctx.messageId;
+  beginReplyTargetTurn(executor, ctx.scope === 'thread' ? ctx.anchor : undefined, executionTurnId,
+    new Date().toISOString(), { senderOpenId: owner, sourceMessageId: session.routerTask!.sourceMessageId,
       participants: [{ openId: owner, isBot: false }], participantsIncomplete: false, inThread: ctx.scope === 'thread' });
   sessionStore.updateSession(session);
   const registration = await claimNewDaemonSession(activeSessions, executor);
@@ -26611,13 +26748,13 @@ async function dispatchOrdinaryRouterTask(
   const caller = await trustedCallerForInboundTurn(ctx.larkAppId, owner, session.ownerUnionId, false, ctx.messageId);
   const sender = { openId: owner, type: 'user' as const };
   const payload = buildNewTopicCliInput(
-    `任务：${result.title}\n对应用户请求消息：${session.routerTask.sourceMessageId}\n\n${result.instruction}`,
+    `任务：${result.title}\n对应用户请求消息：${session.routerTask!.sourceMessageId}\n\n${result.instruction}`,
     session.sessionId, cfg.cliId, cfg.cliPathOverride, undefined, undefined,
     await getAvailableBots(ctx.larkAppId, ctx.chatId), undefined,
     { name: getBot(ctx.larkAppId).botName, openId: getBot(ctx.larkAppId).botOpenId }, localeForBot(ctx.larkAppId), sender,
     { larkAppId: ctx.larkAppId, chatId: ctx.chatId, trustedCaller: caller });
   await router.bind(result.attemptId, session.sessionId);
-  forkWorker(executor, payload, { turnId: ctx.messageId, trustedCaller: caller }, {
+  forkWorker(executor, payload, { turnId: executionTurnId, trustedCaller: caller }, {
     onAdmission: admission => {
       if (admission === 'accepted') {
         markIngressAdmitted(ctx);

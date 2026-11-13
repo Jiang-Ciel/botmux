@@ -1465,11 +1465,12 @@ export function normalizeAgentRouter(raw: unknown): BotConfig['agentRouter'] {
   if (raw === false) return false;
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('agentRouter must be false or an object');
   const entry = raw as Record<string, unknown>;
-  if (Object.keys(entry).some(key => !['executable', 'model'].includes(key))) throw new Error('unknown agentRouter option');
+  if (Object.keys(entry).some(key => !['executable', 'model', 'poolSize'].includes(key))) throw new Error('unknown agentRouter option');
   for (const key of ['executable', 'model']) {
     if (entry[key] !== undefined && (typeof entry[key] !== 'string' || !(entry[key] as string).trim())) throw new Error(`invalid agentRouter ${key}`);
   }
-  return { executable: entry.executable as string | undefined, model: entry.model as string | undefined };
+  if (entry.poolSize !== undefined && (!Number.isInteger(entry.poolSize) || Number(entry.poolSize) < 1 || Number(entry.poolSize) > 16)) throw new Error('invalid agentRouter poolSize');
+  return { executable: entry.executable as string | undefined, model: entry.model as string | undefined, poolSize: entry.poolSize as number | undefined };
 }
 
 export interface BotConfig {
@@ -1598,7 +1599,7 @@ export interface BotConfig {
    */
   model?: string;
   /** Ordinary human messages use a hidden router by default; false restores direct execution. */
-  agentRouter?: false | { executable?: string; model?: string };
+  agentRouter?: false | { executable?: string; model?: string; poolSize?: number };
   /** Experimental TraeX-only ordered model allowlist used when model=`auto`.
    * The first entry is the core model; later entries are capacity fallbacks.
    * Missing keeps the feature off. */

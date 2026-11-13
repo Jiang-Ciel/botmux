@@ -462,16 +462,19 @@ export function beginReplyTargetTurn(
   replyRootId: string | undefined,
   turnId: string,
   nowIso = new Date().toISOString(),
-  opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: TurnParticipant[]; participantsIncomplete?: boolean; inThread?: boolean; foldedRootId?: string; sourceMessageId?: string },
+  opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: TurnParticipant[]; participantsIncomplete?: boolean; inThread?: boolean; foldedRootId?: string; sourceMessageId?: string;
+    /** Host-authenticated origin of this turn on a reusable Router executor.
+     * Does not mutate its stable runtime/session identity or older turns. */
+    routerOrigin?: { scope: 'chat' | 'thread'; chatId: string; threadRootId: string } },
 ): void {
   if (isLarkChatId(replyRootId)) replyRootId = undefined;
   // #597: the frozen per-turn dispatch context — the authoritative reply target
   // for THIS turn's Codex App dispatch (steer/queued/opening). Independent of the
   // mention-back participant record below; both are written per turn.
   const exactTarget = resolveInboundReplyTarget({
-    scope: ds.scope,
-    chatId: ds.chatId,
-    threadRootId: ds.session.rootMessageId,
+    scope: opts?.routerOrigin?.scope ?? ds.scope,
+    chatId: opts?.routerOrigin?.chatId ?? ds.chatId,
+    threadRootId: opts?.routerOrigin?.threadRootId ?? ds.session.rootMessageId,
     replyRootId,
     quoteOnly: opts?.quoteOnly,
   });
@@ -499,7 +502,7 @@ export function beginReplyTargetTurn(
     // "answered flat but the inbound was already inside a topic" (a native
     // topic seed). Thread-scope turns route off session.rootMessageId and
     // never consult this, so recording it there would only be dead metadata.
-    ...(ds.scope === 'chat' && opts?.inThread !== undefined
+    ...((opts?.routerOrigin?.scope ?? ds.scope) === 'chat' && opts?.inThread !== undefined
       ? { inThread: opts.inThread }
       : {}),
   };
@@ -525,7 +528,7 @@ export function beginReplyTargetTurn(
   // ONLY sender attribution + participants + updatedAt — no chat routing
   // metadata can leak in, or readers (isSubstituteTurn, footer isSubstitute)
   // would misread it.
-  const isChatScope = ds.scope === 'chat';
+  const isChatScope = (opts?.routerOrigin?.scope ?? ds.scope) === 'chat';
   const targets = { ...(ds.session.replyTargets ?? {}) };
   targets[turnId] = {
     ...(isChatScope && replyRootId ? { rootMessageId: replyRootId } : {}),
@@ -542,7 +545,7 @@ export function beginReplyTargetTurn(
   );
   ds.session.replyTargets = targets;
 
-  if (ds.scope !== 'chat') return;
+  if (!isChatScope) return;
   if (replyRootId) {
     const aliases = { ...(ds.replyThreadAliases ?? ds.session.replyThreadAliases ?? {}) };
     aliases[replyRootId] = {

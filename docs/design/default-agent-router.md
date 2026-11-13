@@ -1,3 +1,5 @@
+> 历史工单式 Router 设计。常驻池与长期对话 Project 的当前行为见 [router-session-pool.md](router-session-pool.md)，后者取代本文的范围锁定、逐任务验收与独立执行 session 策略。
+
 # 默认隐藏 Agent Router
 
 ## 职责与入口

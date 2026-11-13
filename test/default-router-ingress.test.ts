@@ -6,6 +6,7 @@ import ts from 'typescript';
 import { DefaultRouter, canonicalRouterProjects, routerConversation, routerExecutionFacts } from '../src/services/default-router.js';
 import { resolvePiModel } from '../src/adapters/cli/pi-model.js';
 import { routerProgressCard, interruptRouterProgress } from '../src/services/router-progress.js';
+import { beginReplyTargetTurn } from '../src/core/reply-target.js';
 import { buildNewTopicCliInput, buildFollowUpCliInput } from '../src/core/session-manager.js';
 
 // Non-text assertion: execute the production daemon function with fake external
@@ -15,8 +16,9 @@ function load(name: string, scope: Record<string, any>) {
   const declaration = source.statements.find(s => ts.isFunctionDeclaration(s) && s.name?.text === name);
   if (!declaration) throw new Error(`missing ${name}`);
   const code = ts.transpileModule(declaration.getText(source), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+  if (scope.sessionStore && !scope.sessionStore.updateRouterTask) scope.sessionStore.updateRouterTask = (session: any, _expected: any, next: any) => { session.routerTask = next; };
   const proxy = new Proxy(scope, { has: (_, key) => key !== Symbol.unscopables,
-    get: (object, key) => key in object ? object[key as string] : (globalThis as any)[key] });
+    get: (object, key) => { if (key === 'sessionStore' && object.sessionStore && !object.sessionStore.updateRouterTask) object.sessionStore.updateRouterTask = (session: any, _expected: any, next: any) => { session.routerTask = next; }; return key in object ? object[key as string] : (globalThis as any)[key]; } });
   return new Function('scope', `with(scope){${code}; return ${name};}`)(proxy);
 }
 function setup() {
@@ -25,6 +27,8 @@ function setup() {
   const ds: any = { workingDir: root, session: { ownerOpenId: 'owner', sessionId: 's', status: 'active' }, worker: { killed: false }, workerReady: true, lastScreenStatus: 'idle', larkAppId: 'app' };
   const scope = { getBot: () => ({ config: { workingDir: root, cliId: 'pi' } }), activeSessions: new Map([['anchor', ds]]),
     sessionKey: (anchor: string) => anchor, config: { session: { dataDir: root } },
+    routerBoards: { ensure: vi.fn(async () => {}), offerProject: vi.fn(async () => {}) },
+    ensureRouterPool: vi.fn(async () => {}), routerPoolRoutes: new Map(),
     routerProgressCard, interruptRouterProgress, DefaultRouter, canonicalRouterProjects, routerConversation, routerExecutionFacts, resolvePiModel, join,
     defaultRouters: new Map([['app:owner', { signature: JSON.stringify(['pi', undefined, undefined]), router: { handle } }]]) };
   Object.assign(scope, { dispatchOrdinaryRouterTask: load('dispatchOrdinaryRouterTask', scope) });
@@ -128,6 +132,75 @@ describe('default router ordinary ingress', () => {
     expect(rejectContinuation).toHaveBeenCalledWith('next');
     expect(send).toHaveBeenCalledTimes(intervention === 'rejected' ? 1 : 0);
     expect(executor.currentReplyTarget.turnId).toBe('original'); expect(executor.session.currentReplyTarget.turnId).toBe('original');
+  });
+  it('prewarms four registered empty sessions and keeps their pool identities independent', async () => {
+    const f = setup(); let sequence = 0;
+    const slots = Array.from({ length: 4 }, (_, i) => ({ id: `slot-${i}`, owner: 'app:owner', recentTaskIds: [] }));
+    const bindSlot = vi.fn(async () => {}); const fork = vi.fn(); const register = vi.fn(async (_sessions, ds) => { f.scope.activeSessions.set(ds.session.sessionId, ds); return { accepted: true }; });
+    Object.assign(f.scope, {
+      sessionStore: { createSession: vi.fn(() => ({ sessionId: `pool-${sequence++}`, status: 'active' })), updateSession: vi.fn() },
+      claimNewDaemonSession: register, forkReservedIdleSession: fork,
+    });
+    const warm = load('ensureRouterPool', f.scope);
+    const router = { retireClosedSlots: vi.fn(async () => {}), releaseSlotCreation: vi.fn(async () => {}), reserveSlots: vi.fn(async () => slots), listSlots: vi.fn(async () => []), bindSlot, slotDirectory: (_owner: string, id: string) => `${f.ds.workingDir}/${id}` };
+    await warm(router, f.input.ctx, f.input.data, 4);
+    expect(register).toHaveBeenCalledTimes(4); expect(fork).toHaveBeenCalledTimes(4); expect(bindSlot).toHaveBeenCalledTimes(4);
+    expect(register.mock.calls.map(call => call[1].session.routerPool.slotId)).toEqual(slots.map(slot => slot.id));
+    expect(register.mock.calls.every(call => call[1].session.routerTask === undefined)).toBe(true);
+  });
+  it('a new one-shot task executes in a reused pool session without creating a replacement', async () => {
+    const f = setup(); const executor: any = { ...f.ds, session: { ...f.ds.session, sessionId: 'pooled', routerPool: { slotId: 'slot', owner: 'app:owner' }, routerTask: { taskId: 'previous' } } };
+    f.scope.activeSessions.set('executor', executor);
+    f.handle.mockResolvedValueOnce({ kind: 'dispatch', instruction: 'unrelated one-shot', project: f.ds.workingDir, attemptId: 'next', taskId: 'new', sessionId: 'pooled', title: 'new' } as any);
+    const createSession = vi.fn(); const send = vi.fn(() => true);
+    Object.assign(f.scope.defaultRouters.get('app:owner').router, { bind: vi.fn(async () => {}), finish: vi.fn(async () => {}) });
+    Object.assign(f.scope, { evaluatePromptGate: async () => ({ allowed: true }), sessionStore: { createSession, updateSession: vi.fn() },
+      trustedCallerForInboundTurn: async () => undefined, buildFollowUpCliInput, sessionPromptInjection: () => 'none', beginReplyTargetTurn: vi.fn(), sendWorkerInput: send,
+      markIngressAdmitted: vi.fn(), beginNewTurn: vi.fn(), rememberLastCliInput: vi.fn(), markSessionActivity: vi.fn() });
+    await f.route(f.input); expect(send).toHaveBeenCalledTimes(1); expect(createSession).not.toHaveBeenCalled(); expect(executor.session.routerTask.taskId).toBe('new');
+  });
+  it('compensates a cold fork that returns true but later rejects admission', async () => {
+    const f = setup(); const previous = { taskId: 'old', attemptId: 'old-a', sourceMessageId: 'old-m', title: 'old' };
+    const executor: any = { ...f.ds, worker: null, session: { ...f.ds.session, sessionId: 'pool', routerPool: { slotId: 'slot', owner: 'app:owner' }, routerTask: previous } };
+    f.scope.activeSessions.set('pool', executor);
+    const reject = vi.fn(async () => {}); const finish = vi.fn(async () => {}); let admission!: (value: string) => void;
+    Object.assign(f.scope.defaultRouters.get('app:owner').router, { bind: vi.fn(async () => {}), finish, rejectContinuation: reject });
+    f.handle.mockResolvedValueOnce({ kind: 'dispatch', sessionId: 'pool', taskId: 'new', attemptId: 'next', project: f.ds.workingDir, instruction: 'next', title: 'new' } as any);
+    Object.assign(f.scope, { evaluatePromptGate: async () => ({ allowed: true }), trustedCallerForInboundTurn: async () => undefined,
+      sessionStore: { updateSession: vi.fn() }, buildFollowUpCliInput, sessionPromptInjection: () => 'none', beginReplyTargetTurn: vi.fn(),
+      forkWorker: vi.fn((_ds, _payload, _turn, options) => { admission = options.onAdmission; return true; }),
+      markIngressAdmitted: vi.fn(), beginNewTurn: vi.fn(), rememberLastCliInput: vi.fn(), markSessionActivity: vi.fn(), logger: { error: vi.fn() } });
+    await f.route(f.input); expect(finish).not.toHaveBeenCalled();
+    admission('rejected'); await vi.waitFor(() => expect(reject).toHaveBeenCalledWith('next'));
+    expect(executor.session.routerTask).toEqual(previous); expect(finish).not.toHaveBeenCalled();
+  });
+  it('releases every unattempted pool slot after definite first registration rejection', async () => {
+    const f = setup(); const release = vi.fn(async () => {});
+    const slots = Array.from({ length: 4 }, (_, i) => ({ id: `slot-${i}`, owner: 'app:owner' }));
+    Object.assign(f.scope, { sessionStore: { createSession: () => ({ sessionId: 's' }), updateSession: vi.fn() },
+      claimNewDaemonSession: async () => ({ accepted: false }) });
+    const router = { retireClosedSlots: vi.fn(async () => {}), reserveSlots: async () => slots,
+      releaseSlotCreation: release, slotDirectory: () => f.ds.workingDir };
+    await expect(load('ensureRouterPool', f.scope)(router, f.input.ctx, f.input.data, 4)).rejects.toThrow('router_pool_registration_failed');
+    expect(release).toHaveBeenCalledTimes(4); expect(release.mock.calls.map(call => call[0])).toEqual(slots.map(slot => slot.id));
+  });
+  it.each([
+    { scope: 'thread', chatId: 'oc_first', anchor: 'om_later_topic', target: { mode: 'thread', rootMessageId: 'om_later_topic' } },
+    { scope: 'thread', chatId: 'oc_other_group', anchor: 'om_other_topic', target: { mode: 'thread', rootMessageId: 'om_other_topic' } },
+    { scope: 'chat', chatId: 'oc_other_group', anchor: 'oc_other_group', target: { mode: 'plain', chatId: 'oc_other_group' } },
+  ])('freezes this task origin, not the pooled first topic: %o', async origin => {
+    const f = setup(); const executor: any = { ...f.ds, scope: 'thread', chatId: 'oc_first', session: { ...f.ds.session, rootMessageId: 'om_first_topic', chatId: 'oc_first', sessionId: 'pooled', routerPool: { slotId: 'slot', owner: 'app:owner' } } };
+    f.scope.activeSessions.set('pooled', executor);
+    f.handle.mockResolvedValueOnce({ kind: 'dispatch', instruction: 'next', project: f.ds.workingDir, sessionId: 'pooled', taskId: 'new', attemptId: 'next' } as any);
+    Object.assign(f.scope.defaultRouters.get('app:owner').router, { bind: vi.fn(async () => {}), finish: vi.fn(async () => {}) });
+    Object.assign(f.scope, { evaluatePromptGate: async () => ({ allowed: true }), trustedCallerForInboundTurn: async () => undefined,
+      sessionStore: { updateSession: vi.fn() }, resolvePinnedWorkingDir: async () => ({ pinnedWorkingDir: f.ds.workingDir }), buildFollowUpCliInput, sessionPromptInjection: () => 'none', beginReplyTargetTurn,
+      sendWorkerInput: () => true, markIngressAdmitted: vi.fn(), beginNewTurn: vi.fn(), rememberLastCliInput: vi.fn(), markSessionActivity: vi.fn() });
+    await f.route({ ...f.input, ctx: { ...f.input.ctx, ...origin, messageId: 'om_new_message' } });
+    expect(executor.session.turnReplyContexts.om_new_message.target).toEqual(origin.target);
+    expect(executor.session.turnReplyContexts.om_new_message.sourceMessageId).toBeUndefined();
+    expect(executor.session.turnReplyContexts.om_new_message.quoteTargetId).toBe('om_new_message');
+    expect(executor.session.rootMessageId).toBe('om_first_topic');
   });
   it('delivers approved instruction in Codex clean input, not the approval keyword', () => {
     const instruction = 'Implement the confirmed task with tests';

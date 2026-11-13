@@ -564,6 +564,7 @@ export interface DaemonSession {
    * generation change: it grants no authority, it only lets the screenshot
    * fence reject a frame from an older attempt of the same turn. In-memory. */
   turnDispatchAttemptHighWater?: { turnId: string; dispatchAttempt: number };
+  routerDeliveredOutput?: { turnId: string; content: string };
   lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
   lastScreenStatus?: StreamStatus;  // last screen_update status
   /** `backgroundTasks` of the last working/idle screen_update: the main turn
@@ -1209,7 +1210,7 @@ export function principalLaneRoutingAnchorId(
 export function runtimeSessionAnchorId(
   ds: Pick<DaemonSession, 'runtimeRoutingAnchor' | 'session' | 'scope' | 'chatId'>,
 ): string {
-  return ds.runtimeRoutingAnchor ?? (ds.session.routerTask ? `router-task:${ds.session.routerTask.taskId}:${ds.session.sessionId}` : sessionAnchorId(ds));
+  return ds.runtimeRoutingAnchor ?? (ds.session.routerPool ? `router-pool:${ds.session.routerPool.slotId}:${ds.session.sessionId}` : ds.session.routerTask ? `router-task:${ds.session.routerTask.taskId}:${ds.session.sessionId}` : sessionAnchorId(ds));
 }
 
 /** Storage key for the daemon-owned activeSessions map. A validated principal
