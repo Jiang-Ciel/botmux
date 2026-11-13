@@ -77,7 +77,7 @@ export class RouterBoardManager {
     const b = [...this.bindings.values()].find(b => b.app === input.app && b.owner === input.owner && b.conversation === input.conversation);
     if (!b) return;
     const tasks = await this.deps.tasks(b);
-    const offer = [...tasks].reverse().find(t => t.projectOffer && t.state !== 'cancelled');
+    const offer = [...tasks].reverse().find(t => (t.projectOffer || t.promptReview) && t.state !== 'cancelled');
     if (offer) await this.deps.reply(b, routerTaskCard(b, tasks, { taskId: offer.id, projects: await this.deps.projects?.(b) }), randomUUID());
   }
   async refreshAll() {
@@ -103,7 +103,7 @@ export class RouterBoardManager {
         await this.deps.reply(b, routerTaskCard(b, tasks, { taskId: task.id, tools: this.deps.tools?.(task), projects: await this.deps.projects?.(b) }), randomUUID());
         return toast('已发送独立节点详情卡，可在卡片中审核');
       }
-      if (!['approve', 'cancel', 'accept', 'supplement', 'create_project', 'direct_task'].includes(v.op) && !v.op.startsWith('merge_project:')) return toast('不支持该操作');
+      if (!['approve', 'cancel', 'accept', 'supplement', 'create_project', 'direct_task', 'send_prompt'].includes(v.op) && !v.op.startsWith('merge_project:')) return toast('不支持该操作');
       if (Number(v.revision) !== task.revision) return toast('节点状态已变化，请刷新节点详情后重新确认。');
       const form = data.action?.form_value; const note = typeof form?.note === 'string' ? form.note.trim() : '';
       if (['approve', 'accept'].includes(v.op) && form?.confirmed !== true) return toast('请先勾选确认项，再提交。');
@@ -115,7 +115,7 @@ export class RouterBoardManager {
       if (!this.deps.allowed(b, operator, data.operator?.union_id)) return toast('操作权限已变化。');
       const notice = await this.deps.execute(b, task, v.op, note, id);
       const updated = await this.deps.tasks(b);
-      await this.deps.reply(b, routerTaskCard(b, updated, { taskId: task.id, notice, tools: this.deps.tools?.(updated.find(t => t.id === task.id) ?? task) }), randomUUID());
+      await this.deps.reply(b, routerTaskCard(b, updated, { taskId: task.id, notice, projects: await this.deps.projects?.(b), tools: this.deps.tools?.(updated.find(t => t.id === task.id) ?? task) }), randomUUID());
       await this.paint(b);
       return toast('操作已处理，请查看最新节点卡。');
     });

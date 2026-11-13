@@ -103,7 +103,7 @@ describe('default router ordinary ingress', () => {
     expect(send).toHaveBeenCalledTimes(1); expect(send.mock.calls[0][0]).toBe(executor);
     expect(bind).toHaveBeenCalledWith('continue-attempt', 'original-session');
     expect(finish).toHaveBeenCalledWith('continue-attempt', 'original-session', true);
-    if (cliId === 'codex-app') expect(send.mock.calls[0][1].codexAppInput.text).toBe('full supplemental code');
+    expect(send.mock.calls[0][1]).toBe('full supplemental code');
   });
   it.each(['interrupted', 'closed', 'attention', 'owner', 'directory', 'removed', 'rejected'])('does not inject or replace a session after a mid-dispatch %s intervention', async intervention => {
     const f = setup(); const executor: any = { ...f.ds, session: { ...f.ds.session, sessionId: 'original-session', routerTask: { taskId: 'task', attemptId: 'old' } } };

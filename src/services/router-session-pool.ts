@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withExclusiveFileLock } from '../utils/file-flock.js';
 import { routerTaskSummaryCard } from '../im/lark/router-task-card.js';
-import { routerDecision, routerNeedsInput, routerTaskInput, type RouterTask, type RouterInput, type RouterResult, type RouterDispatch, type RouterProvider } from './default-router.js';
+import { routerDecision, routerNeedsInput, type RouterTask, type RouterInput, type RouterResult, type RouterDispatch, type RouterProvider } from './default-router.js';
 
 export interface PoolSlot {
   id: string; owner: string; sessionId?: string; workingDir?: string;
@@ -14,7 +14,7 @@ export interface ConversationProject {
   id: string; owner: string; title: string; taskId: string; sessionId?: string; revision: number; closed?: boolean;
 }
 interface State { version: 1; slots: PoolSlot[]; tasks: RouterTask[]; projects: ConversationProject[] }
-export interface PoolInput extends RouterInput { routingOrigin?: RouterTask['routingOrigin']; poolSize?: number; projectAction?: 'create' | 'merge' | 'direct'; mergeProjectId?: string; projectName?: string }
+export interface PoolInput extends RouterInput { routingOrigin?: RouterTask['routingOrigin']; poolSize?: number; projectAction?: 'create' | 'merge' | 'direct'; mergeProjectId?: string; projectName?: string; confirmPrompt?: boolean }
 const digest = (s: string) => createHash('sha256').update(s).digest('hex').slice(0, 16);
 const active = (t: RouterTask) => ['dispatching', 'running', 'blocked'].includes(t.state);
 
@@ -56,7 +56,7 @@ export class RouterSessionPool {
       // RESULT is an executor outcome, not hidden reasoning. Transport delivery
       // remains authoritative, but different adapters may settle its turn later.
       if (!f.busy && !waiting && f.turnId === t.attempt?.turnId && f.delivered) {
-        t.state = t.conversationProjectId ? 'review' : t.queued && t.directSessionId ? 'proposed' : 'completed'; t.revision++;
+        t.state = t.conversationProjectId ? 'review' : (t.queued || t.promptReview) && t.directSessionId ? 'proposed' : 'completed'; t.revision++;
         const slot = s.slots.find(slot => slot.taskId === t.id);
         if (slot && !t.conversationProjectId) { slot.taskId = undefined; slot.recentTaskIds = [...slot.recentTaskIds.filter(id => id !== t.id), t.id].slice(-12); }
       } else if (result >= 0 && !f.busy && !waiting && f.turnId === t.attempt?.turnId && !f.delivered) {
@@ -109,6 +109,7 @@ export class RouterSessionPool {
   }
   private ready(f: NonNullable<RouterInput['execution']> | undefined) { return !!f && !f.busy && !f.waiting && !f.closed && !f.interrupted; }
   private claim(s: State, t: RouterTask, input: PoolInput, preferredSession?: string): RouterResult {
+    if (t.promptReview || t.promptNeedsInput) return { kind: 'reply', text: '改写消息等待确认或反馈，尚未发送。' };
     if (!input.projects.includes(t.project)) return { kind: 'reply', text: '该任务的工作目录不在当前授权列表，未派发。' };
     if (t.approvalRequired) return { kind: 'reply', text: '该操作需要确认授权，请使用任务卡片。' };
     if (['completed', 'cancelled'].includes(t.state) && !t.conversationProjectId) return { kind: 'reply', text: '该单次任务已结束，不会重派。' };
@@ -136,7 +137,7 @@ export class RouterSessionPool {
     } else {
       const f = facts.find(f => f.sessionId === sessionId);
       const prior = s.tasks.find(other => other.id === project.taskId);
-      if (!sessionId || !f || f.closed || f.interrupted || prior?.state === 'dispatching' || f.busy || f.waiting && !routerNeedsInput(f.response)) {
+      if (!sessionId || !f || f.closed || f.interrupted || ['running', 'dispatching'].includes(prior?.state ?? '') || f.busy || f.waiting && !routerNeedsInput(f.response)) {
         t.queued = true; return { kind: 'reply', text: '- 已补充到原对话 Project，原 session 忙或等待受管交互，空闲后继续。' };
       }
     }
@@ -150,7 +151,7 @@ export class RouterSessionPool {
     t.executionDirectory = project ? t.executionDirectory : slot?.workingDir;
     if (!t.executionDirectory) throw new Error('router_pool_directory_missing');
     return { kind: 'dispatch', taskId: t.id, attemptId, sessionId, project: t.executionDirectory, title: t.title,
-      sourceMessageId: input.messageId, instruction: `${project ? '这是长期研讨的下一轮，允许按本轮用户需求拓展和修改，不要以旧范围拒绝。' : '这是独立的一次性任务；不要把 session 中不相关的旧任务作为本次要求。'}\n${t.isolated ? '仅处理提供的文本或公共信息，不访问代码仓库。' : `授权代码仓库：${t.project}；工具操作使用该绝对目录，不要修改池的启动目录。`}\n${routerTaskInput(t)}`,
+      sourceMessageId: input.messageId, instruction: t.instruction,
       summary: `- ${project ? '对话 Project' : '单次任务'}：${project?.title ?? t.title}\n- 需求：${t.instruction}\n- ${project ? '沿用唯一 session/task 持续迭代。' : '完成后关闭本次 task，保留池 session。'}` };
   }
   async handle(input: PoolInput): Promise<RouterResult> {
@@ -171,6 +172,13 @@ export class RouterSessionPool {
       let t = target ? linked.find(t => t.id === target) : undefined;
       if (target && !t) return { result: { kind: 'reply' as const, text: '任务不属于当前对话或请求者。' } };
       if (input.expectedRevision !== undefined && (!t || t.revision !== input.expectedRevision)) return { result: { kind: 'reply' as const, text: '任务卡片已变化，请刷新。' } };
+      if (input.confirmPrompt && t) {
+        if (!t.promptReview || t.promptNeedsInput || !t.instruction.trim() || t.projectOffer || ['cancelled', 'blocked'].includes(t.state)) return { result: { kind: 'reply' as const, text: '待发送消息已变化或仍需选择归属，请刷新卡片。' } };
+        t.promptReview = false; t.seen.push(input.messageId); t.revision++;
+        if (['running', 'dispatching'].includes(t.state)) { t.queued = true; return { result: { kind: 'reply' as const, text: '已确认，原轮完成后发送本条消息。' } }; }
+        if (t.state === 'completed') t.state = 'proposed';
+        return { result: this.claim(s, t, input, t.attempt?.sessionId) };
+      }
       if (input.projectAction && t) {
         if (input.projectAction === 'direct') {
           if (!t.projectOffer || t.conversationProjectId || t.state === 'cancelled') return { result: { kind: 'reply' as const, text: '归属选择已失效，请刷新卡片。' } };
@@ -210,28 +218,37 @@ export class RouterSessionPool {
         if (!p || !t.projectOffer?.candidates.includes(p.id)) return { result: { kind: 'reply' as const, text: '归并目标已变化或不属于当前请求者。' } };
         if (active(t)) return { result: { kind: 'reply' as const, text: '原任务仍在执行，暂不迁移或归并；请等待本轮完成。' } };
         const dest = s.tasks.find(task => task.id === p.taskId)!;
+        if (t.projectOffer?.candidateRevisions?.[p.id] !== dest.revision || dest.promptReview || dest.promptNeedsInput || dest.approvalRequired) return { result: { kind: 'reply' as const, text: '归并目标需求版本已变化或仍等待反馈/授权；本次归并未应用，请重新提出归并。' } };
         if (!input.projects.includes(dest.project)) return { result: { kind: 'reply' as const, text: '归并目标的工作目录已不在授权范围。' } };
         for (const h of t.history.filter(h => h.role === 'user')) dest.history.push(h);
-        dest.instruction = t.instruction || dest.instruction; dest.approvalRequired = t.approvalRequired === true;
+        dest.instruction = t.instruction || dest.instruction; dest.promptReview = t.promptReview; dest.promptNeedsInput = t.promptNeedsInput; dest.approvalRequired = t.approvalRequired === true;
         dest.proposalRevision = dest.revision + 1; dest.routingOrigin = t.routingOrigin ?? dest.routingOrigin; dest.conversations = [...new Set([...(dest.conversations ?? [dest.conversation]), input.conversation])];
         dest.sources ??= []; dest.sources.push(...(t.sources ?? [])); dest.revision++; dest.seen.push(input.messageId);
-        t.state = 'cancelled'; t.projectOffer = undefined; t.seen.push(input.messageId); t.revision++;
+        t.state = 'cancelled'; t.projectOffer = undefined; t.promptReview = false; t.promptNeedsInput = false; t.seen.push(input.messageId); t.revision++;
         return { result: this.claim(s, dest, input, p.sessionId) };
       }
       if (match) {
         t ??= linked.filter(t => /批准|approve/i.test(match[1]) ? t.state === 'proposed' && t.approvalRequired : /验收|accept/i.test(match[1]) ? t.state === 'review' : !['completed', 'cancelled'].includes(t.state)).at(-1);
         if (!t) return { result: { kind: 'reply' as const, text: '没有匹配的任务。' } };
         if (match[3] && Number(match[3]) !== (t.proposalRevision ?? t.revision)) return { result: { kind: 'reply' as const, text: '方案版本已变化。' } };
-        if (/批准|approve/i.test(match[1]) && t.approvalRequired && !['dispatching', 'blocked'].includes(t.state)) { t.approvalRequired = false; t.seen.push(input.messageId); return { result: this.claim(s, t, input) }; }
+        if (/批准|approve/i.test(match[1]) && t.approvalRequired && !['dispatching', 'blocked'].includes(t.state)) { t.approvalRequired = false; t.revision++; t.seen.push(input.messageId); return { result: this.claim(s, t, input) }; }
         if (/取消|cancel/i.test(match[1]) && !active(t)) { t.state = 'cancelled'; t.queued = false; t.seen.push(input.messageId); t.revision++; return { result: { kind: 'reply' as const, text: '已取消未执行任务。' } }; }
         if (/验收|accept/i.test(match[1]) && t.state === 'review') { t.state = 'completed'; t.queued = false; t.projectOffer = undefined; t.seen.push(input.messageId); t.revision++; const p = s.projects.find(p => p.taskId === t!.id); if (p) p.closed = true; return { result: { kind: 'reply' as const, text: '对话 Project 已结束。' } }; }
         return { result: { kind: 'reply' as const, text: '当前状态不能执行该操作；不会停止或重放运行中的任务。' } };
       }
+      // A sole pending preview in this conversation is the feedback target.
+      if (!t && !target) {
+        const pending = linked.filter(t => t.state !== 'cancelled' && (t.promptReview || t.promptNeedsInput));
+        if (pending.length === 1) t = pending[0];
+      }
+      // Feedback invalidates the old send card before asynchronous analysis.
+      const feedback = !!t?.promptReview || !!t?.promptNeedsInput;
+      if (t && feedback) { t.revision++; t.proposalRevision = t.revision; t.promptNeedsInput = true; t.queued = false; }
       const scratch: RouterTask = { id: randomUUID(), owner: input.owner, conversation: input.conversation, conversations: [input.conversation], revision: 1, state: 'collecting', title: '', project: '', instruction: '', history: [{ role: 'user', text: input.text, messageId: input.messageId }], seen: [], sources: [{ conversation: input.conversation, messageId: input.messageId, relation: 'input' }], routingOrigin: input.routingOrigin };
       s.tasks.push(scratch);
       const recent = s.tasks.filter(t => t.owner === input.owner && t.id !== scratch.id).reverse().filter(t => t.state !== 'cancelled').slice(0, 12);
       const projects = s.projects.filter(p => p.owner === input.owner && !p.closed);
-      return { task: structuredClone(scratch), recent: structuredClone(recent), projects: structuredClone(projects), explicitTask: t?.id };
+      return { task: structuredClone(scratch), recent: structuredClone(recent), projects: structuredClone(projects), explicitTask: t?.id, feedback };
     });
     if (snapshot.result) return snapshot.result;
     const scratch = snapshot.task!;
@@ -245,35 +262,62 @@ export class RouterSessionPool {
       const draft = s.tasks.find(t => t.id === scratch.id)!;
       if (draft.revision !== scratch.revision) return { kind: 'reply', text: '需求已变化，本轮未派发。' };
       draft.seen.push(input.messageId); draft.revision++;
-      if (decision.action === 'reply' || decision.action === 'clarify') { draft.history.push({ role: 'assistant', text: decision.message }); return { kind: 'reply', text: decision.message }; }
       const targetId = snapshot.explicitTask ?? decision.targetTaskId;
       const old = targetId ? s.tasks.find(t => t.id === targetId && t.owner === input.owner && (!t.project || input.projects.includes(t.project))) : undefined;
+      const expectedTarget = snapshot.recent?.find(t => t.id === targetId);
+      if (targetId && (!old || !expectedTarget || old.revision !== expectedTarget.revision)) {
+        draft.state = 'cancelled'; return { kind: 'reply', text: '目标需求或授权版本已变化，过期分析未应用。请重新反馈。' };
+      }
+      if (decision.action === 'clarify') {
+        const pending = old ?? draft;
+        pending.promptReview = true; pending.promptNeedsInput = true; pending.queued = false; pending.revision++;
+        pending.history.push({ role: 'user', text: input.text, messageId: input.messageId }, { role: 'assistant', text: decision.message });
+        pending.seen.push(input.messageId);
+        if (old) draft.state = 'cancelled';
+        return { kind: 'reply', text: decision.message };
+      }
+      if (decision.action === 'reply') { draft.history.push({ role: 'assistant', text: decision.message }); return { kind: 'reply', text: decision.message }; }
+      const rewrite = snapshot.feedback || decision.promptMode === 'rewrite';
+      if (snapshot.feedback && old) {
+        const project = old.project || decision.project || input.projects[0] || '';
+        if (!input.projects.includes(project)) return { kind: 'reply', text: '请明确允许的工作目录；新消息仍未发送。' };
+        old.project = project; old.title ||= decision.title || '对话任务';
+        old.isolated ??= decision.isolated ?? true; old.coreWork = decision.message.trim().slice(0, 800) || old.title;
+        old.routingOrigin = input.routingOrigin ?? old.routingOrigin;
+        if (old.state === 'collecting') old.state = 'proposed';
+        old.history.push({ role: 'user', text: input.text, messageId: input.messageId });
+        old.instruction = decision.instruction; old.promptReview = true; old.promptNeedsInput = !decision.instruction.trim();
+        old.approvalRequired = old.approvalRequired || decision.requiresApproval === true;
+        old.revision++; old.proposalRevision = old.revision; old.seen.push(input.messageId); draft.state = 'cancelled';
+        return { kind: 'reply', text: '已更新完整待发送消息，请查看卡片并确认，尚未发送。' };
+      }
       if (old?.conversationProjectId && !s.projects.some(p => p.id === old.conversationProjectId && p.owner === input.owner && !p.closed)) {
         draft.state = 'cancelled'; return { kind: 'reply', text: '原对话 Project 已结束，本轮分析不再派发。' };
       }
       if (targetId && !old) return { kind: 'reply', text: '相关任务不存在或不在授权范围；请重新指定。' };
       // Existing long projects accept changing educational/iterative requests.
       if (old?.conversationProjectId && (decision.action === 'continue' || !!snapshot.explicitTask)) {
-        old.history.push({ role: 'user', text: input.text, messageId: input.messageId }); old.instruction = decision.instruction || input.text; old.coreWork = decision.message.trim().slice(0, 800) || old.title;
+        old.history.push({ role: 'user', text: input.text, messageId: input.messageId }); old.instruction = rewrite ? decision.instruction : input.text; old.promptReview = rewrite; old.promptNeedsInput = false; old.coreWork = decision.message.trim().slice(0, 800) || old.title;
         old.revision++; old.proposalRevision = old.revision; old.conversations = [...new Set([...(old.conversations ?? [old.conversation]), input.conversation])];
         old.seen.push(input.messageId); old.routingOrigin = input.routingOrigin ?? old.routingOrigin; draft.state = 'cancelled';
         if (decision.requiresApproval) { old.approvalRequired = true; old.queued = true; if (!active(old)) old.state = 'proposed'; return { kind: 'reply', text: `${decision.message}\n- 本轮操作需要授权确认，已保留到原 Project，不执行。` }; }
         return this.claim(s, old, input, old.attempt?.sessionId);
       }
       draft.title = decision.title || old?.title || '对话任务'; draft.project = decision.project || old?.project || input.projects[0] || '';
-      draft.instruction = decision.instruction || input.text; draft.coreWork = decision.message.trim().slice(0, 800) || draft.title;
+      draft.instruction = rewrite ? decision.instruction : input.text; draft.promptReview = rewrite; draft.promptNeedsInput = false; draft.coreWork = decision.message.trim().slice(0, 800) || draft.title;
       if (old?.state === 'collecting' && !old.projectOffer) { draft.history = [...old.history, ...draft.history]; old.state = 'cancelled'; old.revision++; } draft.isolated = decision.isolated ?? old?.isolated ?? true;
       if (!input.projects.includes(draft.project)) return { kind: 'reply', text: '请明确允许的工作目录；对话 Project 不要求绑定代码仓库。' };
       const long = decision.longTerm === true || (decision.action === 'continue' || !!snapshot.explicitTask) && !!old;
       const candidates = (decision.similarProjectIds ?? []).filter(id => snapshot.projects?.some(p => p.id === id));
       if (long || candidates.length) {
         draft.approvalRequired = decision.requiresApproval === true;
-        draft.projectOffer = { title: decision.projectName || draft.title, candidates, relatedTaskId: old?.id };
+        draft.projectOffer = { title: decision.projectName || draft.title, candidates,
+          candidateRevisions: Object.fromEntries(candidates.map(id => { const p = s.projects.find(p => p.id === id)!; return [id, s.tasks.find(t => t.id === p.taskId)?.revision ?? -1]; })), relatedTaskId: old?.id };
         if (old && long) {
           // The card promotes the existing task/session, preserving identity.
-          old.history.push({ role: 'user', text: input.text, messageId: input.messageId }); old.instruction = draft.instruction; old.coreWork = draft.coreWork; old.revision++;
+          old.history.push({ role: 'user', text: input.text, messageId: input.messageId }); old.instruction = draft.instruction; old.promptReview = draft.promptReview; old.coreWork = draft.coreWork; old.revision++;
           old.projectOffer = draft.projectOffer; old.approvalRequired = draft.approvalRequired; old.proposalRevision = old.revision; old.conversations = [...new Set([...(old.conversations ?? [old.conversation]), input.conversation])];
-          old.seen.push(input.messageId); old.routingOrigin = input.routingOrigin ?? old.routingOrigin; draft.state = 'cancelled'; draft.projectOffer = undefined;
+          old.seen.push(input.messageId); old.routingOrigin = input.routingOrigin ?? old.routingOrigin; draft.state = 'cancelled'; draft.projectOffer = undefined; draft.promptReview = false;
           return { kind: 'reply', text: '- 这是连续研讨，已保留到原任务。请在对话卡片创建长期 Project，或确认归并到相似 Project；无需另开任务。' };
         }
         return { kind: 'reply', text: '- 已识别长期对话，请在卡片创建 Project；如有相似 Project，可确认归并。' };
@@ -303,7 +347,7 @@ export class RouterSessionPool {
     return this.tx(s => {
       this.reconcileState(s, this.facts(input), input.owner);
       const results: RouterDispatch[] = [];
-      for (const t of s.tasks.filter(t => t.owner === input.owner && t.queued && !['completed', 'cancelled'].includes(t.state) && !t.approvalRequired && !t.projectOffer)) {
+      for (const t of s.tasks.filter(t => t.owner === input.owner && t.queued && !['completed', 'cancelled'].includes(t.state) && !t.approvalRequired && !t.promptReview && !t.promptNeedsInput && !t.projectOffer)) {
         const result = t.conversationProjectId ? this.claimProjectOrReserve(s, t, { ...input, messageId: t.history.filter(h => h.role === 'user').at(-1)?.messageId ?? input.messageId })
           : this.claim(s, t, { ...input, messageId: t.history.filter(h => h.role === 'user').at(-1)?.messageId ?? input.messageId });
         if (result.kind === 'dispatch') results.push(result);

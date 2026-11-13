@@ -59,7 +59,7 @@ describe('persistent pool and iterative conversation projects', () => {
     const nextFacts = facts.map(e => e.sessionId === first.sessionId ? { ...e, turnId: 'create', response: '[BOTMUX_TASK_RESULT] checklist' } : e);
     const next = await f.pool.handle({ ...f.input, messageId: 'examples', text: 'More timedelta examples', executions: nextFacts });
     if (next.kind !== 'dispatch') throw new Error('missing iteration'); expect(next.sessionId).toBe(first.sessionId); expect(next.taskId).toBe(first.taskId);
-    expect(next.instruction).toContain('More timedelta examples'); expect(next.instruction).toContain('datetime checklist');
+    expect(next.instruction).toBe('More timedelta examples'); expect(next.instruction).not.toContain('datetime checklist');
     expect((await f.pool.listProjects(f.input.owner))).toHaveLength(1);
   });
   it('releases uncreated slot claims after definite prewarm failure and replaces only closed executors', async () => {
@@ -150,6 +150,78 @@ describe('persistent pool and iterative conversation projects', () => {
     expect((await f.pool.listTasks()).find(t => t.id === task.id)?.queued).toBe(false);
     expect(await f.pool.drain({ ...f.input, executions: closed })).toEqual([]);
   });
+  it('passes a clear original prompt byte-for-byte, without executor scaffolding or history', async () => {
+    const f = await setup(1); const text = '修正如下代码，完整输出\nfrom datetime imprt datetime\n\n dt = datetime()\nprint(dt)\n';
+    f.decide.mockResolvedValueOnce({ action: 'propose', title: '修正代码', project: f.project, instruction: '不要传递这段规范化说明', message: '- 修正代码', isolated: true, promptMode: 'raw' });
+    const result = await f.pool.handle({ ...f.input, text }); if (result.kind !== 'dispatch') throw new Error('missing');
+    expect(result.instruction).toBe(text); expect(result.instruction).not.toContain('BOTMUX_TASK');
+  });
+  it('shows an exact rewrite and waits for confirmation; direct Project exit cannot bypass review', async () => {
+    const f = await setup(1);
+    f.decide.mockResolvedValueOnce({ action: 'propose', title: '清单', project: f.project, instruction: '提供中文 datetime 速查表。', message: '- 速查表', isolated: true, promptMode: 'rewrite', longTerm: true });
+    expect((await f.pool.handle({ ...f.input, text: '这个给个' })).kind).toBe('reply');
+    let task = (await f.pool.listTasks()).find(t => t.promptReview)!;
+    expect(await f.pool.drain(f.input)).toEqual([]);
+    await f.pool.handle({ ...f.input, targetTaskId: task.id, expectedRevision: task.revision, text: task.title, projectAction: 'direct', messageId: 'direct' });
+    task = (await f.pool.listTasks()).find(t => t.id === task.id)!;
+    expect(task.promptReview).toBe(true); expect(task.attempt).toBeUndefined();
+    expect((await f.pool.handle({ ...f.input, owner: 'app:other', targetTaskId: task.id, expectedRevision: task.revision, confirmPrompt: true, messageId: 'other' })).kind).toBe('reply');
+    expect((await f.pool.handle({ ...f.input, targetTaskId: task.id, expectedRevision: task.revision - 1, confirmPrompt: true, messageId: 'stale' })).kind).toBe('reply');
+    const result = await f.pool.handle({ ...f.input, targetTaskId: task.id, expectedRevision: task.revision, confirmPrompt: true, messageId: 'confirm' });
+    if (result.kind !== 'dispatch') throw new Error('missing'); expect(result.instruction).toBe('提供中文 datetime 速查表。');
+    expect((await f.pool.handle({ ...f.input, targetTaskId: task.id, confirmPrompt: true, messageId: 'duplicate' })).kind).toBe('reply');
+  });
+  it('confirmation of a rewrite does not authorize a dangerous operation', async () => {
+    const f = await setup(1); f.decide.mockResolvedValueOnce({ action: 'propose', title: '危险操作', project: f.project, instruction: '删除仓库。', message: '- 操作', promptMode: 'rewrite', requiresApproval: true });
+    await f.pool.handle({ ...f.input, text: '删那个' }); const task = (await f.pool.listTasks())[0];
+    await f.pool.handle({ ...f.input, targetTaskId: task.id, expectedRevision: task.revision, messageId: 'confirm', confirmPrompt: true });
+    expect((await f.pool.listTasks())[0].approvalRequired).toBe(true); expect((await f.pool.listTasks())[0].attempt).toBeUndefined();
+  });
+  it('invalidates preview before feedback and never sends a clarification or feedback fragment', async () => {
+    const f = await setup(1);
+    f.decide.mockResolvedValueOnce({ action: 'propose', title: '清单', project: f.project, instruction: '提供中文 datetime 速查表。', message: '- 清单', promptMode: 'rewrite' });
+    await f.pool.handle(f.input); const old = (await f.pool.listTasks())[0];
+    f.decide.mockResolvedValueOnce({ action: 'clarify', title: '', project: '', instruction: 'not a sendable task', message: '哪种格式？' });
+    await f.pool.handle({ ...f.input, targetTaskId: old.id, messageId: 'feedback', text: '改成那种格式' });
+    let task = (await f.pool.listTasks()).find(t => t.id === old.id)!;
+    expect(task.promptNeedsInput).toBe(true); expect(task.revision).toBeGreaterThan(old.revision);
+    expect((await f.pool.handle({ ...f.input, targetTaskId: old.id, expectedRevision: old.revision, confirmPrompt: true, messageId: 'stale' })).kind).toBe('reply');
+    expect((await f.pool.handle({ ...f.input, targetTaskId: old.id, expectedRevision: task.revision, confirmPrompt: true, messageId: 'missing' })).kind).toBe('reply');
+    f.decide.mockResolvedValueOnce({ action: 'continue', targetTaskId: old.id, title: '', project: '', instruction: 'Provide an English datetime cheatsheet.', message: '- English', promptMode: 'raw' });
+    await f.pool.handle({ ...f.input, messageId: 'english', text: '改为英文' });
+    task = (await f.pool.listTasks()).find(t => t.id === old.id)!;
+    expect(task.instruction).toBe('Provide an English datetime cheatsheet.'); expect(task.promptReview).toBe(true); expect(task.promptNeedsInput).toBe(false);
+    expect(await f.pool.drain(f.input)).toEqual([]);
+    const sent = await f.pool.handle({ ...f.input, targetTaskId: old.id, expectedRevision: task.revision, confirmPrompt: true, messageId: 'send' });
+    if (sent.kind !== 'dispatch') throw new Error('missing'); expect(sent.instruction).toBe(task.instruction);
+  });
+  it('initial clarification can be completed into a preview with a valid task and then sent', async () => {
+    const f = await setup(1);
+    f.decide.mockResolvedValueOnce({ action: 'clarify', title: '', project: '', instruction: '', message: '需要什么清单？' });
+    await f.pool.handle({ ...f.input, text: '清单' }); const original = (await f.pool.listTasks())[0];
+    f.decide.mockResolvedValueOnce({ action: 'propose', title: 'datetime 清单', project: f.project, instruction: '提供 datetime 清单。', message: '- 清单', isolated: true, promptMode: 'rewrite' });
+    await f.pool.handle({ ...f.input, messageId: 'answer', targetTaskId: original.id, text: 'datetime' });
+    const task = (await f.pool.listTasks()).find(t => t.id === original.id)!;
+    expect(task.project).toBe(f.project); expect(task.state).toBe('proposed'); expect(task.promptReview).toBe(true);
+    const sent = await f.pool.handle({ ...f.input, messageId: 'send', targetTaskId: task.id, expectedRevision: task.revision, confirmPrompt: true });
+    expect(sent.kind).toBe('dispatch'); if (sent.kind === 'dispatch') expect(sent.instruction).toBe('提供 datetime 清单。');
+  });
+  it('rejects an old merge offer after destination enters a new preview', async () => {
+    const f = await setup(); const first = await dispatch(f);
+    const done = f.executions.map(e => e.sessionId === first.sessionId ? { ...e, delivered: true, turnId: 'original', response: '[BOTMUX_TASK_RESULT] done' } : e);
+    const created = await f.pool.handle({ ...f.input, targetTaskId: first.taskId, projectAction: 'create', messageId: 'create', text: 'Project', executions: done });
+    if (created.kind !== 'dispatch') throw new Error('missing'); await f.pool.finish(created.attemptId, created.sessionId, true);
+    for (const e of done) if (e.sessionId === created.sessionId) e.turnId = 'create'; await f.pool.reconcile(done);
+    const [p] = await f.pool.listProjects(f.input.owner);
+    f.decide.mockResolvedValueOnce({ action: 'propose', title: 'Merge', project: f.project, instruction: 'old source', message: '- merge', longTerm: true, similarProjectIds: [p.id] });
+    await f.pool.handle({ ...f.input, conversation: 'another', messageId: 'offer', text: 'old source', executions: done });
+    const source = (await f.pool.listTasks()).find(t => t.projectOffer)!;
+    f.decide.mockResolvedValueOnce({ action: 'continue', targetTaskId: first.taskId, title: '', project: '', instruction: 'new guarded destination', message: '- new', promptMode: 'rewrite', requiresApproval: true });
+    await f.pool.handle({ ...f.input, targetTaskId: first.taskId, messageId: 'new', text: 'new', executions: done });
+    const merge = await f.pool.handle({ ...f.input, conversation: 'another', targetTaskId: source.id, expectedRevision: source.revision, projectAction: 'merge', mergeProjectId: p.id, messageId: 'merge', text: 'merge', executions: done });
+    expect(merge.kind).toBe('reply'); const target = (await f.pool.listTasks()).find(t => t.id === first.taskId)!;
+    expect(target.instruction).toBe('new guarded destination'); expect(target.promptReview).toBe(true); expect(target.approvalRequired).toBe(true);
+  });
   it('validates configurable pool size without changing legacy router settings', async () => {
     const { normalizeAgentRouter } = await import('../src/bot-registry.js');
     expect(normalizeAgentRouter({ poolSize: 4 })).toMatchObject({ poolSize: 4 });
@@ -232,6 +304,8 @@ describe('persistent pool and iterative conversation projects', () => {
     const created = await f.pool.handle({ ...f.input, targetTaskId: first.taskId, projectAction: 'create', projectName: 'Python', messageId: 'create', text: 'Python', executions: facts });
     if (created.kind !== 'dispatch') throw new Error('missing'); await f.pool.finish(created.attemptId, created.sessionId, true);
     const [project] = await f.pool.listProjects(f.input.owner);
+    for (const e of facts) if (e.sessionId === created.sessionId) e.turnId = 'create';
+    await f.pool.reconcile(facts);
     f.decide.mockResolvedValueOnce({ action: 'propose', title: 'Dates', project: f.project, instruction: 'date examples', message: '- examples', requiresApproval: true, longTerm: true, similarProjectIds: [project.id], isolated: true });
     await f.pool.handle({ ...f.input, conversation: 'another', messageId: 'dates', text: 'date examples', executions: facts });
     const offer = (await f.pool.listTasks()).find(t => t.projectOffer?.candidates.includes(project.id))!; expect(offer.attempt).toBeUndefined();

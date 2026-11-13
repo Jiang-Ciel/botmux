@@ -43,6 +43,18 @@ describe('router board host CAS', () => {
     const cancelled = routerTaskCard(b, [{ ...task, state: 'cancelled' }], { taskId: task.id });
     expect(cancelled.body.elements.some((e: any) => e.name === 'router_project')).toBe(false);
   });
+  it('shows the exact rewritten prompt and offers confirmation or feedback, not task approval', async () => {
+    const task = { ...sample, promptReview: true, instruction: '提供中文 datetime 速查表。' };
+    const root = mkdtempSync(join(tmpdir(), 'router-prompt-card-'));
+    const { board, deps } = manager(root, { tasks: async () => [task] }); await board.ensure(binding);
+    const [b] = JSON.parse(readFileSync(join(root, 'boards.json'), 'utf8'));
+    const card = routerTaskCard(b, [task], { taskId: task.id });
+    expect(card.header.title.content).toContain('即将发送');
+    expect(card.body.elements.find((e: any) => e.tag === 'div').text.content).toBe(task.instruction);
+    expect(card.body.elements.some((e: any) => e.tag === 'button' && e.behaviors[0].value.op === 'send_prompt')).toBe(true);
+    await board.handle(event(b, 'send_prompt', {}), 'app');
+    expect(deps.execute).toHaveBeenCalledWith(expect.anything(), task, 'send_prompt', '', expect.any(String));
+  });
   it('renders a project creation card and requires a real callback to merge only offered projects', async () => {
     const task = { ...sample, projectOffer: { title: 'Python syntax', candidates: ['python-project'] } };
     const card = routerTaskCard({ ...binding, id: 'b' }, [task], { taskId: task.id, projects: [{ id: 'python-project', title: 'Python' }, { id: 'unrelated', title: 'Other' }] });

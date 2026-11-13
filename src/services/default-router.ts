@@ -14,6 +14,7 @@ export const routerDecision = z.object({
   title: z.string().max(160),
   project: z.string().max(4096),
   instruction: z.string().max(32000),
+  promptMode: z.enum(['raw', 'rewrite']).optional(),
   targetTaskId: z.string().optional(),
   newTask: z.boolean().optional(),
   isolated: z.boolean().optional(),
@@ -44,10 +45,12 @@ export interface RouterTask {
   sources?: Array<{ conversation: string; messageId: string; relation: string }>;
   isolated?: boolean;
   routingOrigin?: { larkAppId: string; chatId: string; chatType: 'p2p' | 'group'; scope: 'chat' | 'thread'; anchor: string };
+  promptReview?: boolean;
+  promptNeedsInput?: boolean;
   coreWork?: string;
   directSessionId?: string;
   conversationProjectId?: string;
-  projectOffer?: { title: string; candidates: string[]; relatedTaskId?: string };
+  projectOffer?: { title: string; candidates: string[]; candidateRevisions?: Record<string, number>; relatedTaskId?: string };
   poolSlotId?: string;
   executionDirectory?: string;
   queued?: boolean;
