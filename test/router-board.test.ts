@@ -28,6 +28,21 @@ function event(b: RouterBoardBinding, op: string, form: any = { confirmed: true 
 }
 function saved(root: string): RouterBoardBinding { return JSON.parse(readFileSync(join(root, 'boards.json'), 'utf8'))[0]; }
 describe('router board host CAS', () => {
+  it('direct-task button is available without project-name input, but still checks owner and revision', async () => {
+    const task = { ...sample, projectOffer: { title: 'Python', candidates: [] } };
+    const root = mkdtempSync(join(tmpdir(), 'router-direct-card-'));
+    const { board, deps } = manager(root, { tasks: async () => [task] }); await board.ensure(binding);
+    const [b] = JSON.parse(readFileSync(join(root, 'boards.json'), 'utf8'));
+    const card = routerTaskCard(b, [task], { taskId: task.id });
+    const direct = card.body.elements.find((e: any) => e.tag === 'button' && e.behaviors[0].value.op === 'direct_task');
+    expect(direct).toBeDefined(); expect(direct.form_action_type).toBeUndefined();
+    const stale = event(b, 'direct_task', {}); stale.action.value.revision = '2';
+    await board.handle(stale, 'app'); expect(deps.execute).not.toHaveBeenCalled();
+    await board.handle(event(b, 'direct_task', {}), 'app');
+    expect(deps.execute).toHaveBeenCalledWith(expect.anything(), task, 'direct_task', '', expect.any(String));
+    const cancelled = routerTaskCard(b, [{ ...task, state: 'cancelled' }], { taskId: task.id });
+    expect(cancelled.body.elements.some((e: any) => e.name === 'router_project')).toBe(false);
+  });
   it('renders a project creation card and requires a real callback to merge only offered projects', async () => {
     const task = { ...sample, projectOffer: { title: 'Python syntax', candidates: ['python-project'] } };
     const card = routerTaskCard({ ...binding, id: 'b' }, [task], { taskId: task.id, projects: [{ id: 'python-project', title: 'Python' }, { id: 'unrelated', title: 'Other' }] });

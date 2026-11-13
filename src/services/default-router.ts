@@ -44,6 +44,8 @@ export interface RouterTask {
   sources?: Array<{ conversation: string; messageId: string; relation: string }>;
   isolated?: boolean;
   routingOrigin?: { larkAppId: string; chatId: string; chatType: 'p2p' | 'group'; scope: 'chat' | 'thread'; anchor: string };
+  coreWork?: string;
+  directSessionId?: string;
   conversationProjectId?: string;
   projectOffer?: { title: string; candidates: string[]; relatedTaskId?: string };
   poolSlotId?: string;
@@ -90,7 +92,7 @@ export function routerExecutionFacts(ds: Pick<DaemonSession, 'session' | 'worker
     delivered: !!routed || ds.session.lastTurn?.outcome === 'delivered' || !!ds.completedIdleTurnId && ds.completedIdleTurnId === ds.currentTurnId, turnId: routed?.turnId ?? (ds.completedIdleTurnId === ds.currentTurnId && ds.completedIdleTurnId ? ds.completedIdleTurnId : ds.session.lastTurn?.turnId), response: routed?.content ?? ds.lastScreenContent, workingDir: ds.workingDir, dormant: !ds.worker || ds.worker.killed };
 }
 export interface RouterDispatch { instruction: string; project: string; attemptId: string; taskId?: string; title?: string; sourceMessageId?: string; sessionId?: string; summary?: string }
-export type RouterResult = { kind: 'reply'; text: string } | ({ kind: 'dispatch'; additional?: RouterDispatch[] } & RouterDispatch);
+export type RouterResult = { kind: 'reply'; text: string; card?: unknown } | ({ kind: 'dispatch'; additional?: RouterDispatch[] } & RouterDispatch);
 /** Explicit executor outcome plus conservative compatibility for old executors. */
 export function routerNeedsInput(response = ''): boolean {
   const prose = response.replace(/```[\s\S]*?```/g, '');

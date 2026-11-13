@@ -1,3 +1,4 @@
+import { routerTaskSummaryCard } from '../src/im/lark/router-task-card.js';
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -29,8 +30,8 @@ function setup() {
     sessionKey: (anchor: string) => anchor, config: { session: { dataDir: root } },
     routerBoards: { ensure: vi.fn(async () => {}), offerProject: vi.fn(async () => {}) },
     ensureRouterPool: vi.fn(async () => {}), routerPoolRoutes: new Map(),
-    routerProgressCard, interruptRouterProgress, DefaultRouter, canonicalRouterProjects, routerConversation, routerExecutionFacts, resolvePiModel, join,
-    defaultRouters: new Map([['app:owner', { signature: JSON.stringify(['pi', undefined, undefined]), router: { handle } }]]) };
+    routerTaskSummaryCard, routerProgressCard, interruptRouterProgress, DefaultRouter, canonicalRouterProjects, routerConversation, routerExecutionFacts, resolvePiModel, join,
+    defaultRouters: new Map([['app:owner', { signature: JSON.stringify(['pi', undefined, undefined]), router: { handle, listTasks: async () => [] } }]]) };
   Object.assign(scope, { dispatchOrdinaryRouterTask: load('dispatchOrdinaryRouterTask', scope) });
   const route = load('routeOrdinaryHuman', scope);
   const input = { ctx: { larkAppId: 'app', chatId: 'chat', scope: 'thread', anchor: 'anchor', messageId: 'm' },
@@ -201,6 +202,15 @@ describe('default router ordinary ingress', () => {
     expect(executor.session.turnReplyContexts.om_new_message.sourceMessageId).toBeUndefined();
     expect(executor.session.turnReplyContexts.om_new_message.quoteTargetId).toBe('om_new_message');
     expect(executor.session.rootMessageId).toBe('om_first_topic');
+  });
+  it('returns a concise task-summary card instead of displaying the full execution instruction', async () => {
+    const f = setup(); const title = '修正 Python 代码'; const instruction = '拒绝 不可用 未接纳 long normalized requirements '.repeat(100);
+    f.handle.mockResolvedValueOnce({ kind: 'dispatch', title, instruction, project: f.ds.workingDir, taskId: 'task', attemptId: 'a' } as any);
+    f.scope.dispatchOrdinaryRouterTask = async (_task: any, _router: any, _ctx: any, _data: any, onStatus: any) => { onStatus('执行请求已接纳'); return instruction; };
+    f.scope.defaultRouters.get('app:owner').router.listTasks = async () => [{ id: 'task', coreWork: '修正导入和当前时间获取，完整输出代码。' }];
+    const result = await f.route(f.input); expect(result.card.header.title.content).toBe(title);
+    expect(result.card.body.elements[0].content).toContain('修正导入');
+    expect(JSON.stringify(result.card)).not.toContain(instruction); expect(result.card.body.elements[1].content).toBe('执行请求已接纳');
   });
   it('delivers approved instruction in Codex clean input, not the approval keyword', () => {
     const instruction = 'Implement the confirmed task with tests';

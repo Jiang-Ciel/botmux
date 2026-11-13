@@ -93,6 +93,63 @@ describe('persistent pool and iterative conversation projects', () => {
     const approved = await f.pool.handle({ ...f.input, messageId: 'new-approval', text: `approve task ${first.taskId} v${current.proposalRevision}`, executions: done });
     expect(approved.kind).toBe('dispatch');
   });
+  it('declines a mistaken Project offer and executes the supplement in the original pooled session', async () => {
+    const f = await setup(1); const first = await dispatch(f);
+    const done = [{ ...f.executions[0], delivered: true, turnId: 'original', response: '[BOTMUX_TASK_RESULT] code' }];
+    f.decide.mockResolvedValueOnce({ action: 'continue', targetTaskId: first.taskId, title: 'Checklist', project: f.project, instruction: 'Provide checklist', message: '- Explain common interfaces', longTerm: true, isolated: true });
+    await f.pool.handle({ ...f.input, messageId: 'checklist', text: 'Provide checklist', executions: done });
+    const task = (await f.pool.listTasks()).find(t => t.id === first.taskId)!;
+    const directInput = { ...f.input, targetTaskId: task.id, expectedRevision: task.revision, messageId: 'direct', text: task.title, projectAction: 'direct' as const, executions: done };
+    expect((await f.pool.handle({ ...directInput, owner: 'app:other' })).kind).toBe('reply');
+    expect((await f.pool.handle({ ...directInput, expectedRevision: task.revision - 1 })).kind).toBe('reply');
+    const result = await f.pool.handle(directInput); if (result.kind !== 'dispatch') throw new Error('missing direct');
+    expect(result.taskId).toBe(first.taskId); expect(result.sessionId).toBe(first.sessionId); expect(result.instruction).toContain('Provide checklist');
+    expect(await f.pool.listProjects(f.input.owner)).toEqual([]);
+    expect((await f.pool.listTasks()).find(t => t.id === task.id)?.projectOffer).toBeUndefined();
+    expect((await f.pool.listTasks()).filter(t => t.state === 'cancelled').every(t => !t.projectOffer)).toBe(true);
+    expect((await f.pool.handle(directInput)).kind).toBe('reply');
+  });
+  it('direct execution keeps real authorization and queues without switching a busy original session', async () => {
+    const f = await setup(1); const first = await dispatch(f);
+    f.decide.mockResolvedValueOnce({ action: 'continue', targetTaskId: first.taskId, title: 'Work', project: f.project, instruction: 'Privileged next step', message: '- Next step', longTerm: true, requiresApproval: true, isolated: true });
+    await f.pool.handle({ ...f.input, messageId: 'next', text: 'Next step', executions: [{ ...f.executions[0], busy: true }] });
+    let task = (await f.pool.listTasks()).find(t => t.id === first.taskId)!;
+    expect((await f.pool.handle({ ...f.input, targetTaskId: task.id, expectedRevision: task.revision, messageId: 'direct', text: task.title, projectAction: 'direct', executions: [{ ...f.executions[0], busy: true }] })).kind).toBe('reply');
+    const done = [{ ...f.executions[0], turnId: 'original', delivered: true, response: '[BOTMUX_TASK_RESULT] done' }];
+    expect(await f.pool.drain({ ...f.input, executions: done })).toEqual([]);
+    task = (await f.pool.listTasks()).find(t => t.id === first.taskId)!;
+    expect(task.approvalRequired).toBe(true); expect(task.state).toBe('proposed');
+    const approved = await f.pool.handle({ ...f.input, text: `approve task ${task.id} v${task.proposalRevision}`, messageId: 'approve', executions: done });
+    if (approved.kind !== 'dispatch') throw new Error('missing'); expect(approved.sessionId).toBe(first.sessionId);
+  });
+  it.each(['running', 'dispatching'])('preserves a direct supplement through a busy tick during %s', async state => {
+    const f = await setup(1); const first = await f.pool.handle(f.input); if (first.kind !== 'dispatch') throw new Error('missing');
+    if (state === 'running') await f.pool.finish(first.attemptId, first.sessionId, true);
+    f.decide.mockResolvedValueOnce({ action: 'continue', targetTaskId: first.taskId, title: 'Next', project: f.project, instruction: 'next checklist', message: '- checklist', longTerm: true, isolated: true });
+    const busy = [{ ...f.executions[0], busy: true }];
+    await f.pool.handle({ ...f.input, messageId: 'supplement', text: 'next checklist', executions: busy });
+    const task = (await f.pool.listTasks()).find(t => t.id === first.taskId)!;
+    await f.pool.handle({ ...f.input, targetTaskId: task.id, expectedRevision: task.revision, messageId: 'direct', text: task.title, projectAction: 'direct', executions: busy });
+    expect(await f.pool.drain({ ...f.input, executions: busy })).toEqual([]);
+    expect((await f.pool.listTasks()).find(t => t.id === task.id)?.state).toBe(state);
+    await f.pool.finish(first.attemptId, first.sessionId, true);
+    const done = [{ ...f.executions[0], delivered: true, turnId: 'original', response: '[BOTMUX_TASK_RESULT] done' }];
+    const next = await f.pool.drain({ ...f.input, executions: done }); expect(next).toHaveLength(1);
+    expect(next[0].sessionId).toBe(first.sessionId); expect(next[0].instruction).toContain('next checklist');
+    expect(await f.pool.drain({ ...f.input, executions: done })).toEqual([]);
+  });
+  it('does not promise automatic direct execution on a closed original session', async () => {
+    const f = await setup(1); const first = await dispatch(f);
+    const done = [{ ...f.executions[0], delivered: true, turnId: 'original', response: '[BOTMUX_TASK_RESULT] done' }];
+    f.decide.mockResolvedValueOnce({ action: 'continue', targetTaskId: first.taskId, title: 'Next', project: f.project, instruction: 'next', message: '- next', longTerm: true });
+    await f.pool.handle({ ...f.input, messageId: 'next', text: 'next', executions: done });
+    const task = (await f.pool.listTasks()).find(t => t.id === first.taskId)!;
+    const closed = [{ ...done[0], closed: true }]; await f.pool.retireClosedSlots(f.input.owner, closed);
+    const result = await f.pool.handle({ ...f.input, targetTaskId: task.id, messageId: 'direct', text: task.title, projectAction: 'direct', executions: closed });
+    expect(result.kind).toBe('reply'); if (result.kind === 'reply') expect(result.text).toContain('无法自动续接');
+    expect((await f.pool.listTasks()).find(t => t.id === task.id)?.queued).toBe(false);
+    expect(await f.pool.drain({ ...f.input, executions: closed })).toEqual([]);
+  });
   it('validates configurable pool size without changing legacy router settings', async () => {
     const { normalizeAgentRouter } = await import('../src/bot-registry.js');
     expect(normalizeAgentRouter({ poolSize: 4 })).toMatchObject({ poolSize: 4 });

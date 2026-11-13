@@ -52,6 +52,7 @@ import { interruptRouterProgress, routerProgressCard, type RouterProgress } from
 import { RouterBoardManager } from './services/router-board.js';
 import { routerTaskGraph } from './services/router-task-graph.js';
 import { publicReplyCardTools } from './im/lark/turn-reply-card.js';
+import { routerTaskSummaryCard } from './im/lark/router-task-card.js';
 import { RouterSessionPool } from './services/router-session-pool.js';
 import { PiRouterProvider } from './services/default-router-pi.js';
 import { resolvePiModel } from './adapters/cli/pi-model.js';
@@ -26462,8 +26463,9 @@ const routerBoards = new RouterBoardManager(join(config.session.dataDir, 'agent-
     const result = await routeOrdinaryHuman({ ctx: { larkAppId: b.app, chatId: b.chatId, chatType: b.chatType,
       scope: b.scope, anchor: b.anchor, messageId: b.sourceMessageId },
       data: { sender: { sender_type: 'user', sender_id: { open_id: b.owner } } },
-      command, text: ['supplement', 'create_project'].includes(op) || op.startsWith('merge_project:') ? note || task.title : command, resources: [], card: { messageId, taskId: task.id, revision: task.revision, note, projectAction: op === 'create_project' ? 'create' : op.startsWith('merge_project:') ? 'merge' : undefined, mergeProjectId: op.startsWith('merge_project:') ? op.slice('merge_project:'.length) : undefined } });
-    return result?.kind === 'reply' ? result.text : '当前入口不可操作；任务未获新增派发，请核查受管执行会话。';
+      command, text: ['supplement', 'create_project'].includes(op) || op.startsWith('merge_project:') ? note || task.title : command, resources: [], card: { messageId, taskId: task.id, revision: task.revision, note, projectAction: op === 'direct_task' ? 'direct' : op === 'create_project' ? 'create' : op.startsWith('merge_project:') ? 'merge' : undefined, mergeProjectId: op.startsWith('merge_project:') ? op.slice('merge_project:'.length) : undefined } });
+    if (result?.kind === 'reply' && result.card) await replyMessage(b.app, b.sourceMessageId, JSON.stringify(result.card), 'interactive', b.scope === 'thread', randomUUID());
+    return result?.kind === 'reply' ? result.card ? '任务已受理，执行状态见摘要卡片。' : result.text : '当前入口不可操作；任务未获新增派发，请核查受管执行会话。';
   },
   error: () => logger.warn('[router] task board transport failed; ledger unchanged'),
 });
@@ -26539,8 +26541,9 @@ async function drainRouterPools() {
       const task = (await entry.router.listTasks(key)).find(t => t.id === result.taskId);
       const origin = task?.routingOrigin;
       const ctx = origin ? { ...route.ctx, ...origin, messageId: result.sourceMessageId ?? route.ctx.messageId } : route.ctx;
-      const reply = await dispatchOrdinaryRouterTask(result, entry.router, ctx, route.data);
-      await sessionReply(ctx.anchor, reply, 'text', ctx.larkAppId);
+      let status = '等待执行接纳回执。';
+      await dispatchOrdinaryRouterTask(result, entry.router, ctx, route.data, value => { status = value; });
+      await sessionReply(ctx.anchor, JSON.stringify(routerTaskSummaryCard(result.title ?? '任务', task?.coreWork ?? result.title ?? '执行用户请求', status)), 'interactive', ctx.larkAppId);
     }
     await ensureRouterPool(entry.router, route.ctx, route.data, getBot(route.ctx.larkAppId).config.agentRouter && getBot(route.ctx.larkAppId).config.agentRouter !== false ? (getBot(route.ctx.larkAppId).config.agentRouter as { poolSize?: number }).poolSize ?? 4 : 4);
   }
@@ -26548,7 +26551,7 @@ async function drainRouterPools() {
 async function routeOrdinaryHuman(input: {
   ctx: RoutingContext; data: any; text: string; command: string; resources: MessageResource[];
   project?: string; skip?: boolean;
-  card?: { messageId: string; taskId: string; revision: number; note: string; projectAction?: 'create' | 'merge'; mergeProjectId?: string };
+  card?: { messageId: string; taskId: string; revision: number; note: string; projectAction?: 'create' | 'merge' | 'direct'; mergeProjectId?: string };
 }): Promise<import('./services/default-router.js').RouterResult | undefined> {
   const { ctx, data } = input;
   const cfg = getBot(ctx.larkAppId).config;
@@ -26634,15 +26637,18 @@ async function routeOrdinaryHuman(input: {
     return result;
   }
   const replies: string[] = [];
+  const statuses: string[] = [];
   for (const task of [result, ...(result.additional ?? [])]) {
-    replies.push(await dispatchOrdinaryRouterTask(task, entry.router, { ...ctx, messageId: input.card?.messageId ?? ctx.messageId }, data));
+    replies.push(await dispatchOrdinaryRouterTask(task, entry.router, { ...ctx, messageId: input.card?.messageId ?? ctx.messageId }, data, value => { statuses.push(value); }));
   }
-  return { kind: 'reply', text: replies.join('\n\n') };
+  const current = (await entry.router.listTasks(key)).find(t => t.id === result.taskId);
+  return { kind: 'reply', text: replies.join('\n\n'), card: routerTaskSummaryCard(result.title ?? '任务', current?.coreWork ?? result.title ?? '执行用户请求', statuses.join('\n') || '等待执行接纳回执。') };
 
 }
 async function dispatchOrdinaryRouterTask(
   result: import('./services/default-router.js').RouterDispatch,
   router: Pick<DefaultRouter, 'bind' | 'finish' | 'rejectContinuation'>, ctx: RoutingContext, data: any,
+  onStatus?: (status: string) => void,
 ): Promise<string> {
   const cfg = getBot(ctx.larkAppId).config;
   const owner = data.sender.sender_id.open_id as string;
@@ -26651,6 +26657,7 @@ async function dispatchOrdinaryRouterTask(
     chatType: ctx.chatType, anchor: ctx.anchor, messageId: ctx.messageId, senderOpenId: owner,
     promptContent: result.instruction, promptAttachments: [] });
   const rejectUnsent = async (text: string) => {
+    onStatus?.(text);
     if (result.sessionId) await router.rejectContinuation(result.attemptId);
     return text;
   };
@@ -26715,13 +26722,14 @@ async function dispatchOrdinaryRouterTask(
       },
     }) : sendWorkerInput(executor, payload, ctx.messageId, { trustedCaller: caller, atMostOnce: true });
     if (!accepted && admission !== 'rejected') await restoreUnsent();
-    if (!accepted || admission === 'rejected') return '原执行会话未接纳输入；已恢复原绑定，任务等待重试。';
+    if (!accepted || admission === 'rejected') { onStatus?.('原执行会话未接纳输入；已恢复原绑定，任务等待重试。'); return '原执行会话未接纳输入；已恢复原绑定，任务等待重试。'; }
     markIngressAdmitted(ctx);
     beginNewTurn(executor, result.instruction, ctx.messageId);
     rememberLastCliInput(executor, result.instruction, payload, ctx.messageId);
     executor.session.quoteTargetId = ctx.messageId; executor.session.quoteTargetSenderOpenId = owner;
     markSessionActivity(executor, Date.now(), { human: true }); sessionStore.updateSession(executor.session);
     if (!cold) await router.finish(result.attemptId, executor.session.sessionId, true);
+    onStatus?.(cold && admission !== 'accepted' ? '等待冷启动最终接纳，不表示已执行。' : '执行请求已接纳，结果将返回本会话。');
     return `${result.summary ?? `- 延续任务：${result.title}`}\n- 原后台 session：${executor.session.sessionId}${cold && admission !== 'accepted' ? '\n- 冷启动等待最终接纳；失败将恢复绑定并排队，不表示已执行。' : ''}`;
   }
   const session = sessionStore.createSession(ctx.chatId, ctx.scope === 'thread' ? ctx.anchor : ctx.messageId,
@@ -26744,7 +26752,7 @@ async function dispatchOrdinaryRouterTask(
       participants: [{ openId: owner, isBot: false }], participantsIncomplete: false, inThread: ctx.scope === 'thread' });
   sessionStore.updateSession(session);
   const registration = await claimNewDaemonSession(activeSessions, executor);
-  if (!registration.accepted) return '执行会话注册失败，记录已保留，不会自动重发。';
+  if (!registration.accepted) { onStatus?.('执行会话注册失败，记录已保留，不会自动重发。'); return '执行会话注册失败，记录已保留，不会自动重发。'; }
   const caller = await trustedCallerForInboundTurn(ctx.larkAppId, owner, session.ownerUnionId, false, ctx.messageId);
   const sender = { openId: owner, type: 'user' as const };
   const payload = buildNewTopicCliInput(
@@ -26762,6 +26770,7 @@ async function dispatchOrdinaryRouterTask(
       }
     },
   });
+  onStatus?.('等待执行接纳回执，结果将返回本会话。');
   return `${result.summary ?? `- 任务：${result.title}`}\n- 后台 session：${session.sessionId}\n- 结果将回到本窗口。`;
 }
 
@@ -27213,7 +27222,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   }
   const routerResult = await routeOrdinaryHuman({ ctx, data, text: content, command: cmdContent, resources,
     project: topicSpec?.workingDir, skip: isBareForceTopic || !!forceTopic || !!workflowGrillPrompt || isForeignBotSender });
-  if (routerResult?.kind === 'reply') { await sessionReply(anchor, routerResult.text, 'text', larkAppId); return; }
+  if (routerResult?.kind === 'reply') { await sessionReply(anchor, routerResult.card ? JSON.stringify(routerResult.card) : routerResult.text, routerResult.card ? 'interactive' : 'text', larkAppId); return; }
   if (routerResult?.kind === 'dispatch') {
     const gate = await evaluatePromptGate('prompt.submit', { larkAppId, chatId, chatType, anchor, messageId,
       senderOpenId, promptContent: routerResult.instruction, promptAttachments: [] });
@@ -29963,7 +29972,7 @@ async function handleThreadReplyAdmitted(
   if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
   const routerResult = await routeOrdinaryHuman({ ctx, data, text: content, command: cmdContent, resources,
     skip: answeringAgentAttention || !!prepared || !!replay || !!workflowHandoff || isForeignBot });
-  if (routerResult?.kind === 'reply') { await sessionReply(anchor, routerResult.text, 'text', larkAppId); return; }
+  if (routerResult?.kind === 'reply') { await sessionReply(anchor, routerResult.card ? JSON.stringify(routerResult.card) : routerResult.text, routerResult.card ? 'interactive' : 'text', larkAppId); return; }
   if (routerResult?.kind === 'dispatch') {
     if (dsPre && canonicalRouterProjects([dsPre.workingDir ?? ''])[0] !== routerResult.project) {
       await sessionReply(anchor, '目标项目与当前执行会话不一致，派发已停止并保留栅栏，请核查后另开话题。', 'text', larkAppId);

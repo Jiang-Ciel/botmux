@@ -103,7 +103,7 @@ export class RouterBoardManager {
         await this.deps.reply(b, routerTaskCard(b, tasks, { taskId: task.id, tools: this.deps.tools?.(task), projects: await this.deps.projects?.(b) }), randomUUID());
         return toast('已发送独立节点详情卡，可在卡片中审核');
       }
-      if (!['approve', 'cancel', 'accept', 'supplement', 'create_project'].includes(v.op) && !v.op.startsWith('merge_project:')) return toast('不支持该操作');
+      if (!['approve', 'cancel', 'accept', 'supplement', 'create_project', 'direct_task'].includes(v.op) && !v.op.startsWith('merge_project:')) return toast('不支持该操作');
       if (Number(v.revision) !== task.revision) return toast('节点状态已变化，请刷新节点详情后重新确认。');
       const form = data.action?.form_value; const note = typeof form?.note === 'string' ? form.note.trim() : '';
       if (['approve', 'accept'].includes(v.op) && form?.confirmed !== true) return toast('请先勾选确认项，再提交。');
