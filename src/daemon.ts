@@ -26474,7 +26474,7 @@ const routerBoards = new RouterBoardManager(join(config.session.dataDir, 'agent-
     const result = await routeOrdinaryHuman({ ctx: { larkAppId: b.app, chatId: b.chatId, chatType: b.chatType,
       scope: b.scope, anchor: b.anchor, messageId: b.sourceMessageId },
       data: { sender: { sender_type: 'user', sender_id: { open_id: b.owner } } },
-      command, text: ['supplement', 'create_project'].includes(op) || op.startsWith('merge_project:') ? note || task.title : command, resources: [], card: { messageId, taskId: task.id, revision: task.revision, note, confirmPrompt: op === 'send_prompt', projectAction: op === 'direct_task' ? 'direct' : op === 'create_project' ? 'create' : op.startsWith('merge_project:') ? 'merge' : undefined, mergeProjectId: op.startsWith('merge_project:') ? op.slice('merge_project:'.length) : undefined } });
+      command, text: ['supplement', 'create_project'].includes(op) || op.startsWith('merge_project:') ? note || task.title : command, resources: [], card: { messageId, taskId: task.id, revision: task.revision, note, confirmPrompt: op === 'send_prompt', sendOriginal: op === 'send_original', projectAction: op === 'direct_task' ? 'direct' : op === 'create_project' ? 'create' : op.startsWith('merge_project:') ? 'merge' : undefined, mergeProjectId: op.startsWith('merge_project:') ? op.slice('merge_project:'.length) : undefined } });
     if (result?.kind === 'reply' && !result.presented && result.card) await replyMessage(b.app, b.sourceMessageId, JSON.stringify(result.card), 'interactive', b.scope === 'thread', randomUUID());
     return result?.kind === 'reply' ? result.notice ?? (result.card ? '' : result.text) : '当前入口不可操作；任务未获新增派发，请核查受管执行会话。';
   },
@@ -26561,7 +26561,7 @@ async function drainRouterPools() {
 async function routeOrdinaryHuman(input: {
   ctx: RoutingContext; data: any; text: string; command: string; resources: MessageResource[];
   project?: string; skip?: boolean;
-  card?: { messageId: string; taskId: string; revision: number; note: string; confirmPrompt?: boolean; projectAction?: 'create' | 'merge' | 'direct'; mergeProjectId?: string };
+  card?: { messageId: string; taskId: string; revision: number; note: string; confirmPrompt?: boolean; sendOriginal?: boolean; projectAction?: 'create' | 'merge' | 'direct'; mergeProjectId?: string };
 }): Promise<import('./services/default-router.js').RouterResult | undefined> {
   const { ctx, data } = input;
   // Keep the original text body separate from the trimmed command lane.
@@ -26623,7 +26623,7 @@ async function routeOrdinaryHuman(input: {
     owner: `${ctx.larkAppId}:${owner}`, messageId: input.card?.messageId ?? ctx.messageId, text: input.text, controlText: input.command, projects,
     targetTaskId: input.card?.taskId, expectedRevision: input.card?.revision, reviewNote: input.card?.note,
     routingOrigin: { larkAppId: ctx.larkAppId, chatId: ctx.chatId, chatType: ctx.chatType, scope: ctx.scope, anchor: ctx.anchor },
-    confirmPrompt: input.card?.confirmPrompt, projectAction: input.card?.projectAction, mergeProjectId: input.card?.mergeProjectId, projectName: input.card?.note,
+    confirmPrompt: input.card?.confirmPrompt, sendOriginal: input.card?.sendOriginal, projectAction: input.card?.projectAction, mergeProjectId: input.card?.mergeProjectId, projectName: input.card?.note,
 
     executions: [...activeSessions.values()].filter(other => other.larkAppId === ctx.larkAppId).map(routerExecutionFacts),
     projectBusy: (project, excludeSessionId) => [...activeSessions.values()].some(other =>

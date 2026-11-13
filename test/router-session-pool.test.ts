@@ -222,6 +222,19 @@ describe('persistent pool and iterative conversation projects', () => {
     expect(merge.kind).toBe('reply'); const target = (await f.pool.listTasks()).find(t => t.id === first.taskId)!;
     expect(target.instruction).toBe('new guarded destination'); expect(target.promptReview).toBe(true); expect(target.approvalRequired).toBe(true);
   });
+  it('lets a user skip clarification and dispatch the exact original prompt once without skipping authorization', async () => {
+    const f = await setup(1); const text = '  查询最近三天北京的天气\r\n';
+    f.decide.mockResolvedValueOnce({ action: 'clarify', title: '', project: '', instruction: '', message: '过去还是未来？' });
+    await f.pool.handle({ ...f.input, text }); const task = (await f.pool.listTasks())[0];
+    expect((await f.pool.handle({ ...f.input, targetTaskId: task.id, expectedRevision: task.revision - 1, sendOriginal: true, messageId: 'stale' })).kind).toBe('reply');
+    const sent = await f.pool.handle({ ...f.input, targetTaskId: task.id, expectedRevision: task.revision, sendOriginal: true, messageId: 'send-original' });
+    if (sent.kind !== 'dispatch') throw new Error('missing'); expect(sent.instruction).toBe(text);
+    expect((await f.pool.handle({ ...f.input, targetTaskId: task.id, sendOriginal: true, messageId: 'again' })).kind).toBe('reply');
+    const g = await setup(1); g.decide.mockResolvedValueOnce({ action: 'clarify', title: '', project: '', instruction: '', message: '哪个文件？', requiresApproval: true });
+    await g.pool.handle({ ...g.input, text: '删除文件' }); const guarded = (await g.pool.listTasks())[0];
+    expect((await g.pool.handle({ ...g.input, targetTaskId: guarded.id, expectedRevision: guarded.revision, sendOriginal: true, messageId: 'send' })).kind).toBe('reply');
+    expect((await g.pool.listTasks())[0].approvalRequired).toBe(true); expect((await g.pool.listTasks())[0].attempt).toBeUndefined();
+  });
   it('validates configurable pool size without changing legacy router settings', async () => {
     const { normalizeAgentRouter } = await import('../src/bot-registry.js');
     expect(normalizeAgentRouter({ poolSize: 4 })).toMatchObject({ poolSize: 4 });

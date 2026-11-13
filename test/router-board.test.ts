@@ -126,6 +126,8 @@ describe('router board host CAS', () => {
       history: [{ role: 'user', text: '查询最近三天北京的天气' }, { role: 'assistant', text: '您想查询过去三天（历史天气），还是从今天起未来三天的天气预报？' }] };
     const card = routerTaskCard({ ...binding, id: 'weather', unified: true, taskId: task.id }, [task], { unified: true, taskId: task.id });
     expect(JSON.stringify(card)).toContain('历史天气'); expect(JSON.stringify(card)).not.toContain('send_prompt');
+    const direct = card.body.elements.find((e: any) => e.tag === 'button' && e.behaviors?.[0]?.value.op === 'send_original');
+    expect(direct).toBeDefined(); expect(direct.form_action_type).toBeUndefined();
     const walk = (value: any) => { if (!value || typeof value !== 'object') return; if (value.tag === 'input') expect(value.max_length ?? 1000).toBeLessThanOrEqual(1000); for (const child of Object.values(value)) if (Array.isArray(child)) child.forEach(walk); else walk(child); };
     walk(card);
   });

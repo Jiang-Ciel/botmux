@@ -46,6 +46,7 @@ export interface RouterTask {
   isolated?: boolean;
   routingOrigin?: { larkAppId: string; chatId: string; chatType: 'p2p' | 'group'; scope: 'chat' | 'thread'; anchor: string };
   mergedIntoTaskId?: string;
+  originalPrompt?: string;
   promptReview?: boolean;
   promptNeedsInput?: boolean;
   coreWork?: string;

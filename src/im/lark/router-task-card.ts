@@ -49,12 +49,13 @@ export function routerTaskCard(b: RouterBoardBinding, tasks: RouterTask[], optio
     elements.push(panel('审核记录', t.audit?.map(a => `${a.at} · ${a.action}\n${a.text ?? ''}`).join('\n\n') ?? '暂无卡片审核记录'));
     if (t.promptNeedsInput) elements.push(md(safe(t.history.filter(h => h.role === 'assistant').at(-1)?.text || '请补充必要信息。')));
     if (t.promptReview && t.state !== 'cancelled') {
-      elements.push(md('**即将发送的消息（尚未发送）**'));
-      elements.push({ tag: 'div', text: plain(t.instruction || '请补充必要信息。') });
+      elements.push(md(t.promptNeedsInput ? '**可补充信息，也可按原文直接发送**' : '**即将发送的消息（尚未发送）**'));
+      elements.push({ tag: 'div', text: plain(t.promptNeedsInput ? t.originalPrompt ?? t.history.find(h => h.role === 'user')?.text ?? t.instruction : t.instruction) });
       elements.push({ tag: 'form', name: 'router_prompt_feedback', elements: [
         { tag: 'input', name: 'note', input_type: 'multiline_text', width: 'fill', required: false, max_length: 1000, placeholder: plain('修改或补充即将发送的消息') },
         button('修改 / 补充', value(b, t, 'supplement'), true),
       ] });
+      if (t.promptNeedsInput) elements.push(button('按原文直接发送', value(b, t, 'send_original')));
       if (!t.projectOffer && !t.promptNeedsInput && t.instruction) elements.push(button('确认发送', value(b, t, 'send_prompt')));
     }
     if (t.projectOffer && t.state !== 'cancelled') {
