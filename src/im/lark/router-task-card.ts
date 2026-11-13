@@ -52,7 +52,7 @@ export function routerTaskCard(b: RouterBoardBinding, tasks: RouterTask[], optio
       elements.push(md('**即将发送的消息（尚未发送）**'));
       elements.push({ tag: 'div', text: plain(t.instruction || '请补充必要信息。') });
       elements.push({ tag: 'form', name: 'router_prompt_feedback', elements: [
-        { tag: 'input', name: 'note', input_type: 'multiline_text', width: 'fill', required: false, max_length: 4000, placeholder: plain('修改或补充即将发送的消息') },
+        { tag: 'input', name: 'note', input_type: 'multiline_text', width: 'fill', required: false, max_length: 1000, placeholder: plain('修改或补充即将发送的消息') },
         button('修改 / 补充', value(b, t, 'supplement'), true),
       ] });
       if (!t.projectOffer && !t.promptNeedsInput && t.instruction) elements.push(button('确认发送', value(b, t, 'send_prompt')));

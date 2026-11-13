@@ -121,6 +121,14 @@ describe('router board host CAS', () => {
     const restored = new RouterBoardManager(root, deps); expect(await restored.present(binding, sample.id)).toBe(false);
     expect(deps.reply).toHaveBeenCalledTimes(1);
   });
+  it('renders the live three-day weather clarification within Feishu input limits', () => {
+    const task: RouterTask = { ...sample, title: '', state: 'collecting', instruction: '', promptReview: true, promptNeedsInput: true,
+      history: [{ role: 'user', text: '查询最近三天北京的天气' }, { role: 'assistant', text: '您想查询过去三天（历史天气），还是从今天起未来三天的天气预报？' }] };
+    const card = routerTaskCard({ ...binding, id: 'weather', unified: true, taskId: task.id }, [task], { unified: true, taskId: task.id });
+    expect(JSON.stringify(card)).toContain('历史天气'); expect(JSON.stringify(card)).not.toContain('send_prompt');
+    const walk = (value: any) => { if (!value || typeof value !== 'object') return; if (value.tag === 'input') expect(value.max_length ?? 1000).toBeLessThanOrEqual(1000); for (const child of Object.values(value)) if (Array.isArray(child)) child.forEach(walk); else walk(child); };
+    walk(card);
+  });
   it('renders a project creation card and requires a real callback to merge only offered projects', async () => {
     const task = { ...sample, projectOffer: { title: 'Python syntax', candidates: ['python-project'] } };
     const card = routerTaskCard({ ...binding, id: 'b' }, [task], { taskId: task.id, projects: [{ id: 'python-project', title: 'Python' }, { id: 'unrelated', title: 'Other' }] });
